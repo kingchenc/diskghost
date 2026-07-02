@@ -1,0 +1,13 @@
+# Rust build output
+/target
+**/target
+
+# Node / Tauri (phase 2)
+node_modules/
+dist/
+src-tauri/target/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.log

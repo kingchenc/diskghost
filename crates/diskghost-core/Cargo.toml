@@ -1,0 +1,15 @@
+[package]
+name = "diskghost-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Fast parallel disk scanning and duplicate detection — the engine behind Diskghost."
+
+[dependencies]
+jwalk = "0.8"
+rayon = "1"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }

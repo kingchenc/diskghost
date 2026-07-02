@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/diskghost-core", "crates/diskghost-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["kingchenc"]
+repository = "https://github.com/kingchenc/diskghost"
+rust-version = "1.80"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
