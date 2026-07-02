@@ -145,6 +145,16 @@ fn build_globset(patterns: &[String]) -> globset::GlobSet {
         .unwrap_or_else(|_| globset::GlobSet::empty())
 }
 
+/// Return the exclude patterns that aren't valid globs, so a caller can warn
+/// instead of silently ignoring a typo like `[bad`.
+pub fn validate_globs(patterns: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .filter(|p| globset::Glob::new(p).is_err())
+        .cloned()
+        .collect()
+}
+
 /// True if `path` should be excluded: the glob matches the whole path, any
 /// component (e.g. a `node_modules` dir), or the file name (e.g. `*.tmp`).
 fn is_excluded(glob: &globset::GlobSet, path: &Path) -> bool {
@@ -160,13 +170,24 @@ fn is_excluded(glob: &globset::GlobSet, path: &Path) -> bool {
 /// Walk `root` recursively in a single pass: collect files (with size), count
 /// directories, and count unreadable entries, honouring [`Options`].
 fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
-    let glob = build_globset(&opts.exclude);
+    let glob = Arc::new(build_globset(&opts.exclude));
 
     let mut wd = jwalk::WalkDir::new(root)
         .skip_hidden(false)
         .follow_links(opts.follow_symlinks);
     if let Some(d) = opts.max_depth {
         wd = wd.max_depth(d);
+    }
+    if !glob.is_empty() {
+        // Prune excluded entries *before* descending, so an excluded directory
+        // (e.g. node_modules) costs no I/O for its entire subtree.
+        let glob = glob.clone();
+        wd = wd.process_read_dir(move |_depth, _path, _state, children| {
+            children.retain(|res| match res {
+                Ok(e) => !is_excluded(&glob, &e.path()),
+                Err(_) => true,
+            });
+        });
     }
 
     let mut files = Vec::new();
@@ -179,10 +200,6 @@ fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
         }
         match entry {
             Ok(e) => {
-                let path = e.path();
-                if is_excluded(&glob, &path) {
-                    continue;
-                }
                 let ft = e.file_type();
                 if ft.is_dir() {
                     if e.depth() > 0 {
@@ -194,7 +211,10 @@ fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
                             let size = m.len();
                             progress.files.fetch_add(1, Ordering::Relaxed);
                             progress.bytes.fetch_add(size, Ordering::Relaxed);
-                            files.push(FileEntry { path, size });
+                            files.push(FileEntry {
+                                path: e.path(),
+                                size,
+                            });
                         }
                         Err(_) => skipped += 1,
                     }
@@ -216,18 +236,14 @@ pub fn walk_files(root: &Path) -> Vec<FileEntry> {
     walk(root, &Options::default(), &Progress::default()).files
 }
 
-/// Scan `root` with default options. See [`scan_with`].
+/// Scan `root` with default options. See [`scan_with_progress`].
 pub fn scan(root: &Path, top_n: usize) -> ScanReport {
-    scan_with(root, top_n, &Options::default())
+    scan_with_progress(root, top_n, &Options::default(), &Progress::default())
 }
 
-/// Scan `root`: total size, the `top_n` biggest immediate sub-folders, the bytes
-/// of files directly in the root, and the `top_n` biggest individual files.
-pub fn scan_with(root: &Path, top_n: usize, opts: &Options) -> ScanReport {
-    scan_with_progress(root, top_n, opts, &Progress::default())
-}
-
-/// Like [`scan_with`] but reports live progress and can be cancelled via [`Progress`].
+/// Scan `root`: total size, the `top_n` biggest immediate sub-folders, the bytes of
+/// files directly in the root, and the `top_n` biggest files. Reports live progress
+/// and can be cancelled via [`Progress`].
 pub fn scan_with_progress(
     root: &Path,
     top_n: usize,
@@ -293,22 +309,17 @@ pub fn scan_with_progress(
     }
 }
 
-/// Find duplicate files under `root` with default options. See [`find_duplicates_with`].
+/// Find duplicate files under `root` with default options. See [`find_duplicates_with_progress`].
 pub fn find_duplicates(root: &Path, min_size: u64) -> Vec<DupGroup> {
-    find_duplicates_with(root, min_size, &Options::default())
+    find_duplicates_with_progress(root, min_size, &Options::default(), &Progress::default())
 }
 
 /// Find groups of byte-identical files under `root`, ignoring files smaller than
-/// `min_size` bytes and zero-byte files.
+/// `min_size` bytes and zero-byte files. Reports live progress and can be cancelled.
 ///
 /// Cheap and correct: group by size, collapse hard links, pre-hash the first
 /// [`PREFIX_LEN`] bytes, then full-hash the survivors (BLAKE3). Parallel across
 /// size groups.
-pub fn find_duplicates_with(root: &Path, min_size: u64, opts: &Options) -> Vec<DupGroup> {
-    find_duplicates_with_progress(root, min_size, opts, &Progress::default())
-}
-
-/// Like [`find_duplicates_with`] but reports live progress and can be cancelled.
 pub fn find_duplicates_with_progress(
     root: &Path,
     min_size: u64,
@@ -608,7 +619,7 @@ mod tests {
             exclude: vec!["*.tmp".into()],
             ..Default::default()
         };
-        let r = scan_with(&d, 20, &opts);
+        let r = scan_with_progress(&d, 20, &opts, &Progress::default());
         assert_eq!(r.total_size, 150, "junk.tmp should be excluded");
 
         // Depth 1: only the root's direct children are visited.
@@ -616,7 +627,7 @@ mod tests {
             max_depth: Some(1),
             ..Default::default()
         };
-        let r2 = scan_with(&d, 20, &shallow);
+        let r2 = scan_with_progress(&d, 20, &shallow, &Progress::default());
         // deeper.bin (depth 3) must not be counted.
         assert!(!r2.top_files.iter().any(|f| f.path.ends_with("deeper.bin")));
         std::fs::remove_dir_all(&d).ok();

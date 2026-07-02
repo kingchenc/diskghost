@@ -1,0 +1,16 @@
+# cargo-deny configuration — supply-chain checks (advisories, bans, sources).
+# Run locally with:  cargo deny check advisories bans sources
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+version = 2
+unknown-registry = "deny"
+unknown-git = "deny"

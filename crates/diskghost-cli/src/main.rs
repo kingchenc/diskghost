@@ -3,14 +3,55 @@
 //! Human-readable by default; `--json` emits machine-readable output for
 //! scripts and agents (headless use).
 
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use diskghost_core::{
-    find_duplicates_with, human_size, reclaim, scan_with, DupGroup, Options, ReclaimAction,
-    ScanReport,
+    find_duplicates_with_progress, human_size, reclaim, scan_with_progress, validate_globs,
+    DupGroup, Options, Progress, ReclaimAction, ScanReport,
 };
+
+/// Run `job` with a `Progress`, printing a live line to stderr while it works
+/// (only when stderr is a terminal, so JSON/pipe output stays clean).
+fn with_progress<T>(job: impl FnOnce(&Progress) -> T) -> T {
+    let progress = Progress::default();
+    if !std::io::stderr().is_terminal() {
+        return job(&progress);
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    let (p, d) = (progress.clone(), done.clone());
+    let handle = std::thread::spawn(move || {
+        while !d.load(Ordering::Relaxed) {
+            eprint!(
+                "\r  working… {} files, {}   ",
+                p.files(),
+                human_size(p.bytes())
+            );
+            let _ = std::io::stderr().flush();
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
+    });
+    let out = job(&progress);
+    done.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+    eprint!("\r\x1b[2K"); // clear the progress line
+    let _ = std::io::stderr().flush();
+    out
+}
+
+fn warn_invalid_globs(patterns: &[String]) {
+    let bad = validate_globs(patterns);
+    if !bad.is_empty() {
+        eprintln!(
+            "warning: ignoring invalid exclude glob(s): {}",
+            bad.join(", ")
+        );
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -112,7 +153,9 @@ fn main() -> ExitCode {
                 eprintln!("error: not a directory: {}", path.display());
                 return ExitCode::FAILURE;
             }
-            let report = scan_with(&path, top, &walk.to_options());
+            warn_invalid_globs(&walk.exclude);
+            let opts = walk.to_options();
+            let report = with_progress(|p| scan_with_progress(&path, top, &opts, p));
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             } else {
@@ -130,7 +173,11 @@ fn main() -> ExitCode {
                 eprintln!("error: not a directory: {}", path.display());
                 return ExitCode::FAILURE;
             }
-            let groups = find_duplicates_with(&path, min_mb * 1024 * 1024, &walk.to_options());
+            warn_invalid_globs(&walk.exclude);
+            let opts = walk.to_options();
+            let groups = with_progress(|p| {
+                find_duplicates_with_progress(&path, min_mb * 1024 * 1024, &opts, p)
+            });
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&groups).unwrap());
             } else {
