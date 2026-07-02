@@ -13,6 +13,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use serde::Serialize;
@@ -27,6 +29,35 @@ pub struct Options {
     /// Glob patterns; a path is skipped if the glob matches the whole path, any
     /// path component, or the file name (so `node_modules` and `*.tmp` both work).
     pub exclude: Vec<String>,
+}
+
+/// Live progress + cancellation shared with a running scan / duplicate search.
+/// Clone it (the inner counters are shared) to observe or cancel from another
+/// thread while the operation runs.
+#[derive(Clone, Default, Debug)]
+pub struct Progress {
+    files: Arc<AtomicU64>,
+    bytes: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Progress {
+    /// Files seen so far.
+    pub fn files(&self) -> u64 {
+        self.files.load(Ordering::Relaxed)
+    }
+    /// Bytes seen so far.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+    /// Ask the running operation to stop as soon as possible.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+    /// Whether cancellation has been requested.
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
 }
 
 /// A single file with its size in bytes.
@@ -128,7 +159,7 @@ fn is_excluded(glob: &globset::GlobSet, path: &Path) -> bool {
 
 /// Walk `root` recursively in a single pass: collect files (with size), count
 /// directories, and count unreadable entries, honouring [`Options`].
-fn walk(root: &Path, opts: &Options) -> Walk {
+fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
     let glob = build_globset(&opts.exclude);
 
     let mut wd = jwalk::WalkDir::new(root)
@@ -143,6 +174,9 @@ fn walk(root: &Path, opts: &Options) -> Walk {
     let mut skipped = 0u64;
 
     for entry in wd {
+        if progress.cancelled() {
+            break;
+        }
         match entry {
             Ok(e) => {
                 let path = e.path();
@@ -156,10 +190,12 @@ fn walk(root: &Path, opts: &Options) -> Walk {
                     }
                 } else if ft.is_file() {
                     match e.metadata() {
-                        Ok(m) => files.push(FileEntry {
-                            path,
-                            size: m.len(),
-                        }),
+                        Ok(m) => {
+                            let size = m.len();
+                            progress.files.fetch_add(1, Ordering::Relaxed);
+                            progress.bytes.fetch_add(size, Ordering::Relaxed);
+                            files.push(FileEntry { path, size });
+                        }
                         Err(_) => skipped += 1,
                     }
                 }
@@ -177,7 +213,7 @@ fn walk(root: &Path, opts: &Options) -> Walk {
 
 /// Walk `root` recursively and return every file with its size (default options).
 pub fn walk_files(root: &Path) -> Vec<FileEntry> {
-    walk(root, &Options::default()).files
+    walk(root, &Options::default(), &Progress::default()).files
 }
 
 /// Scan `root` with default options. See [`scan_with`].
@@ -188,11 +224,21 @@ pub fn scan(root: &Path, top_n: usize) -> ScanReport {
 /// Scan `root`: total size, the `top_n` biggest immediate sub-folders, the bytes
 /// of files directly in the root, and the `top_n` biggest individual files.
 pub fn scan_with(root: &Path, top_n: usize, opts: &Options) -> ScanReport {
+    scan_with_progress(root, top_n, opts, &Progress::default())
+}
+
+/// Like [`scan_with`] but reports live progress and can be cancelled via [`Progress`].
+pub fn scan_with_progress(
+    root: &Path,
+    top_n: usize,
+    opts: &Options,
+    progress: &Progress,
+) -> ScanReport {
     let Walk {
         files,
         dirs,
         skipped,
-    } = walk(root, opts);
+    } = walk(root, opts, progress);
 
     let total_size: u64 = files.iter().map(|f| f.size).sum();
     let total_files = files.len() as u64;
@@ -259,7 +305,17 @@ pub fn find_duplicates(root: &Path, min_size: u64) -> Vec<DupGroup> {
 /// [`PREFIX_LEN`] bytes, then full-hash the survivors (BLAKE3). Parallel across
 /// size groups.
 pub fn find_duplicates_with(root: &Path, min_size: u64, opts: &Options) -> Vec<DupGroup> {
-    let files: Vec<FileEntry> = walk(root, opts)
+    find_duplicates_with_progress(root, min_size, opts, &Progress::default())
+}
+
+/// Like [`find_duplicates_with`] but reports live progress and can be cancelled.
+pub fn find_duplicates_with_progress(
+    root: &Path,
+    min_size: u64,
+    opts: &Options,
+    progress: &Progress,
+) -> Vec<DupGroup> {
+    let files: Vec<FileEntry> = walk(root, opts, progress)
         .files
         .into_iter()
         .filter(|f| f.size >= min_size && f.size > 0)
@@ -576,6 +632,26 @@ mod tests {
         assert_eq!(done.reclaimed, 2 * size);
         assert!(done.errors.is_empty());
         assert!(!dup1.exists() && !dup2.exists() && keep.exists());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn progress_counts_and_cancel_stops() {
+        let d = tmpdir("progress");
+        write(&d.join("a/1.bin"), &[0u8; 10]);
+        write(&d.join("a/2.bin"), &[0u8; 20]);
+
+        let p = Progress::default();
+        let r = scan_with_progress(&d, 10, &Options::default(), &p);
+        assert_eq!(r.total_files, 2);
+        assert_eq!(p.files(), 2);
+        assert_eq!(p.bytes(), 30);
+
+        // Pre-cancelled: the walk stops immediately and sees nothing.
+        let c = Progress::default();
+        c.cancel();
+        let r2 = scan_with_progress(&d, 10, &Options::default(), &c);
+        assert_eq!(r2.total_files, 0);
         std::fs::remove_dir_all(&d).ok();
     }
 
