@@ -8,25 +8,32 @@
   </head>
   <body>
     <header class="topbar">
-      <div class="brand"><span class="ghost">👻</span> Diskghost</div>
+      <div class="brand"><span class="ghost" aria-hidden="true">👻</span> Diskghost</div>
       <div class="tagline">fast disk usage &amp; duplicate finder</div>
     </header>
 
-    <section class="controls">
-      <input id="path" type="text" spellcheck="false"
-        placeholder="Paste a folder path — e.g. C:\Users\me\Desktop" />
+    <section class="controls" aria-label="Scan controls">
+      <div class="pathrow">
+        <label class="sr-only" for="path">Folder path</label>
+        <input id="path" type="text" spellcheck="false"
+          placeholder="Paste a folder path, drop a folder here, or use Browse…" />
+        <button id="btn-browse" type="button">Browse…</button>
+      </div>
       <div class="opts">
-        <label>Top <input id="top" type="number" value="20" min="1" max="500" /></label>
-        <label>Min MB <input id="mb" type="number" value="1" min="0" max="100000" /></label>
+        <label>Top <input id="top" type="number" value="20" min="1" max="1000" /></label>
+        <label>Min MB <input id="mb" type="number" value="1" min="0" max="1000000" /></label>
+        <label>Max depth <input id="depth" type="number" min="1" max="100" placeholder="∞" /></label>
+        <label>Exclude <input id="exclude" type="text" placeholder="node_modules, *.tmp" /></label>
+        <label class="chk"><input id="follow" type="checkbox" /> Follow symlinks</label>
       </div>
       <div class="actions">
-        <button id="btn-scan" class="primary">Scan size</button>
-        <button id="btn-dupes">Find duplicates</button>
+        <button id="btn-scan" class="primary" type="button">Scan size</button>
+        <button id="btn-dupes" type="button">Find duplicates</button>
       </div>
     </section>
 
-    <div id="status" class="status"></div>
-    <main id="results"></main>
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+    <main id="results" tabindex="-1"></main>
 
     <script src="app.js"></script>
   </body>
