@@ -16,3 +16,10 @@ same-file = "1"
 globset = "0.4"
 trash = "5"
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "scan"
+harness = false
