@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Diskghost</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand"><span class="ghost">👻</span> Diskghost</div>
+      <div class="tagline">fast disk usage &amp; duplicate finder</div>
+    </header>
+
+    <section class="controls">
+      <input id="path" type="text" spellcheck="false"
+        placeholder="Paste a folder path — e.g. C:\Users\me\Desktop" />
+      <div class="opts">
+        <label>Top <input id="top" type="number" value="20" min="1" max="500" /></label>
+        <label>Min MB <input id="mb" type="number" value="1" min="0" max="100000" /></label>
+      </div>
+      <div class="actions">
+        <button id="btn-scan" class="primary">Scan size</button>
+        <button id="btn-dupes">Find duplicates</button>
+      </div>
+    </section>
+
+    <div id="status" class="status"></div>
+    <main id="results"></main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

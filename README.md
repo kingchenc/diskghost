@@ -51,6 +51,17 @@ diskghost dupes . --min-mb 10 --json
 `dupes --json` returns duplicate groups with their reclaimable bytes. Perfect
 for wiring into an automation/agent that decides what to clean.
 
+## Desktop app (GUI)
+
+A modern Tauri desktop UI lives in `gui/` — paste a path, hit **Scan size** for
+the biggest folders/files, or **Find duplicates** to see reclaimable space. From
+`gui/src-tauri`:
+
+```bash
+cargo tauri dev      # run the app
+cargo tauri build    # bundle an installer
+```
+
 ## Layout
 
 ```
@@ -58,14 +69,14 @@ Diskghost/
 ├── crates/
 │   ├── diskghost-core/   the engine: scan + duplicate detection (a library)
 │   └── diskghost-cli/    the `diskghost` command
-└── (GUI lands here in phase 2)
+└── gui/                 Tauri desktop app (modern dark UI)
 ```
 
 ## Roadmap
 
 - [x] Core: parallel scan, folder/file sizes, duplicate detection
 - [x] CLI with human + JSON output
-- [ ] Modern GUI (treemap + duplicate browser)
+- [x] Modern GUI (Tauri): size bars + duplicate browser
 - [ ] Interactive delete / move (with a dry-run guard)
 - [ ] Signed release binaries for Windows/macOS/Linux
 

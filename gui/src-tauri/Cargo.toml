@@ -1,0 +1,21 @@
+[package]
+name = "diskghost-gui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Diskghost desktop GUI (Tauri) — modern disk usage & duplicate finder."
+repository = "https://github.com/kingchenc/diskghost"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+diskghost-core = { path = "../../crates/diskghost-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
