@@ -3,12 +3,48 @@
 const { invoke } = window.__TAURI__.core;
 const $ = (id) => document.getElementById(id);
 
-// Cap how many rows we build at once so a huge scan can't freeze the webview.
-const RENDER_CAP = 500;
+let lastGroups = []; // duplicate groups from the last search
+let dupShown = []; // groups currently shown (filtered/sorted)
+const keepSel = new Map(); // group hash -> chosen keep path
 
-let lastGroups = []; // duplicate groups from the last search (for sort/filter/reclaim)
+// ---------------------------------- i18n ----------------------------------
+const I18N = {
+  en: {
+    pathLabel: "Folder path", browse: "Browse…", top: "Top", minmb: "Min MB",
+    depth: "Max depth", exclude: "Exclude", follow: "Follow symlinks",
+    scan: "Scan size", dupes: "Find duplicates", cancel: "Cancel",
+    placeholder: "Paste a folder path, drop a folder here, or use Browse…",
+    total: "total", files: "files", folders: "folders", skipped: "skipped",
+    map: "Map (click a tile to drill in)", biggestFolders: "Biggest sub-folders",
+    biggestFiles: "Biggest files", rootFiles: "file(s) directly in this folder",
+    noDupes: "No duplicates found 🎉", groups: "groups", reclaimable: "reclaimable",
+    filter: "Filter", sort: "Sort", dryRun: "Dry-run", reclaimShown: "Reclaim shown",
+    enterPath: "Enter a folder path.", working: "Working…", cancelling: "Cancelling…",
+    showing: "showing", of: "of", keep: "keep",
+  },
+  de: {
+    pathLabel: "Ordnerpfad", browse: "Durchsuchen…", top: "Top", minmb: "Min MB",
+    depth: "Max Tiefe", exclude: "Ausschließen", follow: "Symlinks folgen",
+    scan: "Größe scannen", dupes: "Duplikate finden", cancel: "Abbrechen",
+    placeholder: "Ordnerpfad einfügen, Ordner hierher ziehen oder Durchsuchen…",
+    total: "gesamt", files: "Dateien", folders: "Ordner", skipped: "übersprungen",
+    map: "Karte (Kachel klicken zum Reinzoomen)", biggestFolders: "Größte Unterordner",
+    biggestFiles: "Größte Dateien", rootFiles: "Datei(en) direkt in diesem Ordner",
+    noDupes: "Keine Duplikate gefunden 🎉", groups: "Gruppen", reclaimable: "freigebbar",
+    filter: "Filter", sort: "Sortierung", dryRun: "Testlauf", reclaimShown: "Ausgewählte freigeben",
+    enterPath: "Ordnerpfad eingeben.", working: "Arbeite…", cancelling: "Breche ab…",
+    showing: "zeige", of: "von", keep: "behalten",
+  },
+};
+const LANG = (navigator.language || "en").toLowerCase().startsWith("de") ? "de" : "en";
+const t = (k) => I18N[LANG][k] ?? I18N.en[k] ?? k;
 
-// ---------- tiny safe DOM builder (textContent only, no innerHTML) ----------
+function applyI18n() {
+  document.querySelectorAll("[data-i18n]").forEach((e) => (e.textContent = t(e.dataset.i18n)));
+  document.querySelectorAll("[data-i18n-ph]").forEach((e) => (e.placeholder = t(e.dataset.i18nPh)));
+}
+
+// ---------------------------- safe DOM builder ----------------------------
 function el(tag, attrs, ...kids) {
   const n = document.createElement(tag);
   if (attrs) {
@@ -35,32 +71,32 @@ function human(bytes) {
   return i === 0 ? `${bytes} B` : `${s.toFixed(1)} ${u[i]}`;
 }
 
-function status(msg) {
-  $("status").textContent = msg || "";
+function baseName(p) {
+  const parts = String(p).split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || p;
 }
+
+function status(msg) { $("status").textContent = msg || ""; }
 
 function setBusy(busy, msg) {
   status(msg);
   $("results").classList.toggle("loading", busy);
-  for (const b of document.querySelectorAll("button, input")) {
-    if (b.id === "btn-cancel") continue; // stays clickable so you can cancel
+  for (const b of document.querySelectorAll("button, input, select")) {
+    if (b.id === "btn-cancel") continue;
     b.disabled = busy;
   }
   const c = $("btn-cancel");
   if (c) c.style.display = busy ? "" : "none";
 }
 
-function showError(msg) {
-  const r = $("results");
-  r.replaceChildren(el("div", { class: "error" }, `⚠ ${msg}`));
+function showError(e) {
+  const msg = typeof e === "string" ? e : e?.message ?? JSON.stringify(e);
+  $("results").replaceChildren(el("div", { class: "error" }, `⚠ ${msg}`));
 }
 
 function readOpts() {
   const depth = parseInt($("depth").value, 10);
-  const exclude = $("exclude").value
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const exclude = $("exclude").value.split(",").map((s) => s.trim()).filter(Boolean);
   return {
     exclude,
     max_depth: Number.isFinite(depth) && depth > 0 ? depth : null,
@@ -68,13 +104,29 @@ function readOpts() {
   };
 }
 
+function renderCrumbs(path) {
+  const nav = $("crumbs");
+  nav.replaceChildren();
+  if (!path) return;
+  const parts = String(path).split(/[\\/]/);
+  let acc = "";
+  const sep = path.includes("\\") ? "\\" : "/";
+  parts.forEach((part, i) => {
+    if (part === "" && i > 0) return;
+    acc = i === 0 ? part || sep : acc + sep + part;
+    const target = acc;
+    nav.append(el("button", { class: "crumb", type: "button", onclick: () => doScan(target) }, part || sep));
+    if (i < parts.length - 1) nav.append(el("span", { class: "crumb sep" }, "›"));
+  });
+}
+
 // ---------------------------------- scan ----------------------------------
 async function doScan(pathOverride) {
   const path = (pathOverride ?? $("path").value).trim();
-  if (!path) return showError("Enter a folder path.");
+  if (!path) return showError(t("enterPath"));
   $("path").value = path;
   const top = parseInt($("top").value, 10) || 20;
-  setBusy(true, "Scanning…");
+  setBusy(true, t("working"));
   try {
     const r = await invoke("scan_dir", { path, top, opts: readOpts() });
     renderScan(r);
@@ -90,147 +142,170 @@ function stat(label, value) {
 }
 
 function renderScan(r) {
+  renderCrumbs(r.root);
   const results = $("results");
-  const frag = document.createDocumentFragment();
+  results.replaceChildren();
 
   const stats = el("div", { class: "stats" },
-    stat("total", human(r.total_size)),
-    stat("files", r.total_files.toLocaleString()),
-    stat("folders", r.total_dirs.toLocaleString()));
-  if (r.skipped > 0) stats.append(stat("skipped", r.skipped.toLocaleString()));
-  frag.append(stats);
+    stat(t("total"), human(r.total_size)),
+    stat(t("files"), r.total_files.toLocaleString()),
+    stat(t("folders"), r.total_dirs.toLocaleString()));
+  if (r.skipped > 0) stats.append(stat(t("skipped"), r.skipped.toLocaleString()));
+  results.append(stats);
 
-  // Treemap: proportional, clickable tiles (drill down into a folder).
+  // Treemap (squarified). If anything goes wrong, we just skip it — the bars below
+  // always render, so the view never breaks.
   if (r.children.length) {
-    frag.append(el("h2", { text: "Map (click a folder to drill in)" }));
+    results.append(el("h2", { text: t("map") }));
     const map = el("div", { class: "treemap" });
-    const maxByTotal = r.total_size || 1;
-    for (const d of r.children) {
-      const tile = el("button", {
-        class: "tile",
-        type: "button",
-        title: `${d.path} — ${human(d.size)}`,
-        style: { flexGrow: String(Math.max(1, Math.round((1000 * d.size) / maxByTotal))) },
-        onclick: () => doScan(d.path),
-      },
-        el("span", { class: "tname", text: baseName(d.path) }),
-        el("span", { class: "tsize", text: human(d.size) }));
-      map.append(tile);
+    results.append(map);
+    try {
+      renderTreemap(map, r.children, r.total_size);
+    } catch (_) {
+      map.remove();
     }
-    frag.append(map);
   }
 
-  // Biggest sub-folders (bars).
-  frag.append(el("h2", { text: "Biggest sub-folders" }));
+  // Biggest sub-folders (bars) — keyboard-accessible drill-in.
+  results.append(el("h2", { text: t("biggestFolders") }));
   const bars = el("div", { class: "bars" });
   const max = r.children.length ? r.children[0].size : 1;
   for (const d of r.children) {
     const fill = el("div", { class: "fill" });
     fill.style.width = `${Math.max(2, (100 * d.size) / max)}%`;
-    const bar = el("div", { class: "bar", onclick: () => doScan(d.path), title: "drill in" },
+    const bar = el("button", { class: "bar", type: "button", title: baseName(d.path), onclick: () => doScan(d.path) },
       fill, el("span", { class: "path", text: d.path }));
     bars.append(el("div", { class: "row" }, bar, el("div", { class: "sz", text: human(d.size) })));
   }
   if (r.root_files_count > 0) {
     bars.append(el("div", { class: "row muted" },
-      el("div", { class: "path", text: `(${r.root_files_count} file(s) directly in this folder)` }),
+      el("div", { class: "path", text: `(${r.root_files_count} ${t("rootFiles")})` }),
       el("div", { class: "sz", text: human(r.root_files_size) })));
   }
-  frag.append(bars);
+  results.append(bars);
 
-  // Biggest files (capped).
-  frag.append(el("h2", { text: "Biggest files" }));
-  const files = el("div", { class: "files" });
-  for (const f of r.top_files.slice(0, RENDER_CAP)) {
-    files.append(el("div", { class: "frow" },
+  // Biggest files — virtualized (only visible rows are in the DOM).
+  results.append(el("h2", { text: t("biggestFiles") }));
+  const vbox = el("div", { class: "vlist" });
+  results.append(vbox);
+  virtualList(vbox, r.top_files, 34, (f) =>
+    el("div", { class: "frow" },
       el("span", { class: "sz", text: human(f.size) }),
       el("span", { class: "path", text: f.path })));
-  }
-  if (r.top_files.length > RENDER_CAP) {
-    files.append(el("div", { class: "muted", text: `… showing ${RENDER_CAP} of ${r.top_files.length} files` }));
-  }
-  frag.append(files);
-
-  results.replaceChildren(frag);
 }
 
-function baseName(p) {
-  const parts = String(p).split(/[\\/]/).filter(Boolean);
-  return parts[parts.length - 1] || p;
+// Squarified treemap into `container` (must already be in the DOM so we can read
+// its pixel size). Falls back to a simple proportional strip on any oddity.
+function renderTreemap(container, children, totalSize) {
+  const W = container.clientWidth || 800;
+  const H = container.clientHeight || 300;
+  const items = children.filter((c) => c.size > 0).map((c) => ({ ...c }));
+  if (!items.length) return;
+  const rects = squarify(items, 0, 0, W, H);
+  for (const rc of rects) {
+    const tile = el("button", {
+      class: "tile", type: "button", title: `${rc.item.path} — ${human(rc.item.size)}`,
+      onclick: () => doScan(rc.item.path),
+    }, el("span", { class: "tname", text: baseName(rc.item.path) }), el("span", { class: "tsize", text: human(rc.item.size) }));
+    tile.style.left = `${rc.x}px`;
+    tile.style.top = `${rc.y}px`;
+    tile.style.width = `${Math.max(0, rc.w - 2)}px`;
+    tile.style.height = `${Math.max(0, rc.h - 2)}px`;
+    container.append(tile);
+  }
+}
+
+// Classic squarified treemap layout. Returns [{item,x,y,w,h}].
+function squarify(items, x, y, w, h) {
+  const total = items.reduce((a, i) => a + i.size, 0) || 1;
+  const scale = (w * h) / total;
+  const boxes = items.map((it) => ({ item: it, area: it.size * scale }));
+  const out = [];
+  let cx = x, cy = y, cw = w, ch = h;
+
+  const worst = (row, len) => {
+    const s = row.reduce((a, r) => a + r.area, 0);
+    const mx = Math.max(...row.map((r) => r.area));
+    const mn = Math.min(...row.map((r) => r.area));
+    return Math.max((len * len * mx) / (s * s), (s * s) / (len * len * mn));
+  };
+  const layout = (row, horizontal) => {
+    const s = row.reduce((a, r) => a + r.area, 0);
+    if (horizontal) {
+      const rh = s / cw;
+      let px = cx;
+      for (const r of row) { const rw = r.area / rh; out.push({ item: r.item, x: px, y: cy, w: rw, h: rh }); px += rw; }
+      cy += rh; ch -= rh;
+    } else {
+      const rw = s / ch;
+      let py = cy;
+      for (const r of row) { const rh = r.area / rw; out.push({ item: r.item, x: cx, y: py, w: rw, h: rh }); py += rh; }
+      cx += rw; cw -= rw;
+    }
+  };
+
+  let i = 0;
+  while (i < boxes.length && cw > 0.5 && ch > 0.5) {
+    const horizontal = cw >= ch;
+    const len = horizontal ? cw : ch;
+    const row = [boxes[i]];
+    let j = i + 1;
+    while (j < boxes.length && worst(row.concat(boxes[j]), len) <= worst(row, len)) {
+      row.push(boxes[j]); j++;
+    }
+    layout(row, horizontal);
+    i = j;
+  }
+  return out;
+}
+
+// Windowed list: only rows in view are built. Guarded — on any failure it falls
+// back to rendering everything.
+function virtualList(container, items, rowH, renderRow) {
+  try {
+    const inner = el("div", { class: "vlist-inner" });
+    inner.style.height = `${items.length * rowH}px`;
+    container.replaceChildren(inner);
+    const draw = () => {
+      const top = container.scrollTop;
+      const vh = container.clientHeight || 400;
+      const start = Math.max(0, Math.floor(top / rowH) - 6);
+      const end = Math.min(items.length, Math.ceil((top + vh) / rowH) + 6);
+      const frag = document.createDocumentFragment();
+      for (let k = start; k < end; k++) {
+        const row = renderRow(items[k], k);
+        row.style.position = "absolute";
+        row.style.top = `${k * rowH}px`;
+        row.style.left = "0";
+        row.style.right = "0";
+        frag.append(row);
+      }
+      inner.replaceChildren(frag);
+    };
+    container.onscroll = draw;
+    draw();
+  } catch (_) {
+    const frag = document.createDocumentFragment();
+    items.forEach((it, k) => frag.append(renderRow(it, k)));
+    container.replaceChildren(frag);
+  }
 }
 
 // -------------------------------- duplicates --------------------------------
 async function doDupes() {
   const path = $("path").value.trim();
-  if (!path) return showError("Enter a folder path.");
+  if (!path) return showError(t("enterPath"));
   const mb = parseInt($("mb").value, 10) || 0;
-  setBusy(true, "Hunting duplicates…");
+  setBusy(true, t("working"));
   try {
     lastGroups = await invoke("find_dupes", { path, mb, opts: readOpts() });
+    keepSel.clear();
     renderDupes();
   } catch (e) {
     showError(e);
   } finally {
     setBusy(false, "");
   }
-}
-
-let dupShown = []; // groups currently shown (after filter/sort) — used by reclaim
-
-function renderDupes() {
-  const results = $("results");
-  if (!lastGroups.length) {
-    results.replaceChildren(el("div", { class: "ok" }, "No duplicates found 🎉"));
-    return;
-  }
-  const totalWasted = lastGroups.reduce((a, g) => a + g.wasted, 0);
-
-  // The toolbar is built ONCE. Typing in the filter only updates the list below,
-  // so the input keeps focus + caret (rebuilding it would drop them each keystroke).
-  const bar = el("div", { class: "dupbar" },
-    el("div", { class: "ok", text: `${lastGroups.length} groups — ${human(totalWasted)} reclaimable` }),
-    labelled("Filter", el("input", { id: "dupfilter", type: "text", oninput: updateDupeList })),
-    labelled("Sort", selectEl("dupsort", "wasted", [["wasted", "wasted"], ["size", "size"], ["count", "count"]], updateDupeList)),
-    selectEl("dupaction", "trash", [["trash", "→ Trash"], ["delete", "Delete"], ["hardlink", "Hard-link"]]),
-    el("button", { type: "button", onclick: () => reclaimShown(true) }, "Dry-run"),
-    el("button", { class: "danger", type: "button", onclick: () => reclaimShown(false) }, "Reclaim shown"));
-
-  const list = el("div", { class: "dupes" });
-  results.replaceChildren(bar, list);
-  updateDupeList();
-}
-
-function computeShown() {
-  const filter = $("dupfilter")?.value?.toLowerCase() || "";
-  const sort = $("dupsort")?.value || "wasted";
-  const groups = lastGroups.filter((g) => !filter || g.files.some((f) => f.toLowerCase().includes(filter)));
-  groups.sort((a, b) =>
-    sort === "size" ? b.size - a.size : sort === "count" ? b.files.length - a.files.length : b.wasted - a.wasted);
-  dupShown = groups;
-  return groups;
-}
-
-function updateDupeList() {
-  const list = document.querySelector(".dupes");
-  if (!list) return;
-  const groups = computeShown();
-  const frag = document.createDocumentFragment();
-  for (const g of groups.slice(0, RENDER_CAP)) {
-    const box = el("div", { class: "dup" });
-    box.append(el("div", { class: "dhead" },
-      el("span", { class: "badge", text: `${g.files.length}×` }),
-      document.createTextNode(` ${human(g.size)} `),
-      el("span", { class: "waste", text: `${human(g.wasted)} reclaimable` })));
-    g.files.forEach((f, i) => {
-      box.append(el("div", { class: "path small" + (i === 0 ? " keep" : "") },
-        (i === 0 ? "keep  " : "dup   ") + f));
-    });
-    frag.append(box);
-  }
-  if (groups.length > RENDER_CAP) {
-    frag.append(el("div", { class: "muted", text: `… showing ${RENDER_CAP} of ${groups.length} groups` }));
-  }
-  list.replaceChildren(frag);
 }
 
 function labelled(text, input) {
@@ -247,23 +322,95 @@ function selectEl(id, value, options, onchange) {
   return s;
 }
 
+function renderDupes() {
+  const results = $("results");
+  renderCrumbs($("path").value.trim());
+  if (!lastGroups.length) {
+    results.replaceChildren(el("div", { class: "ok" }, t("noDupes")));
+    return;
+  }
+  const totalWasted = lastGroups.reduce((a, g) => a + g.wasted, 0);
+
+  // Toolbar built once; typing in the filter only updates the list (keeps focus).
+  const bar = el("div", { class: "dupbar" },
+    el("div", { class: "ok", text: `${lastGroups.length} ${t("groups")} — ${human(totalWasted)} ${t("reclaimable")}` }),
+    labelled(t("filter"), el("input", { id: "dupfilter", type: "text", oninput: updateDupeList })),
+    labelled(t("sort"), selectEl("dupsort", "wasted", [["wasted", "wasted"], ["size", "size"], ["count", "count"]], updateDupeList)),
+    selectEl("dupaction", "trash", [["trash", "→ Trash"], ["delete", "Delete"], ["hardlink", "Hard-link"]]),
+    el("button", { type: "button", onclick: () => reclaimShown(true) }, t("dryRun")),
+    el("button", { class: "danger", type: "button", onclick: () => reclaimShown(false) }, t("reclaimShown")));
+
+  const list = el("div", { class: "dupes" });
+  results.replaceChildren(bar, list);
+  updateDupeList();
+}
+
+function computeShown() {
+  const filter = $("dupfilter")?.value?.toLowerCase() || "";
+  const sort = $("dupsort")?.value || "wasted";
+  const groups = lastGroups.filter((g) => !filter || g.files.some((f) => f.toLowerCase().includes(filter)));
+  groups.sort((a, b) =>
+    sort === "size" ? b.size - a.size : sort === "count" ? b.files.length - a.files.length : b.wasted - a.wasted);
+  dupShown = groups;
+  return groups;
+}
+
+function keptPath(g) {
+  return keepSel.get(g.hash) ?? g.files[0];
+}
+
+function updateDupeList() {
+  const list = document.querySelector(".dupes");
+  if (!list) return;
+  const groups = computeShown();
+  const frag = document.createDocumentFragment();
+  for (const g of groups.slice(0, 1000)) {
+    const box = el("div", { class: "dup" });
+    box.append(el("div", { class: "dhead" },
+      el("span", { class: "badge", text: `${g.files.length}×` }),
+      document.createTextNode(` ${human(g.size)} `),
+      el("span", { class: "waste", text: `${human(g.wasted)} ${t("reclaimable")}` })));
+    const kept = keptPath(g);
+    g.files.forEach((f) => {
+      const isKeep = f === kept;
+      const radio = el("input", {
+        type: "radio", name: `keep-${g.hash}`, title: t("keep"),
+        onchange: () => { keepSel.set(g.hash, f); updateDupeList(); },
+      });
+      if (isKeep) radio.checked = true;
+      box.append(el("label", { class: "dupfile" + (isKeep ? " kept" : "") }, radio, el("span", { class: "path", text: f })));
+    });
+    frag.append(box);
+  }
+  if (groups.length > 1000) {
+    frag.append(el("div", { class: "muted", text: `… ${t("showing")} 1000 ${t("of")} ${groups.length} ${t("groups")}` }));
+  }
+  list.replaceChildren(frag);
+}
+
 async function reclaimShown(dryRun) {
   const action = $("dupaction")?.value || "trash";
   const jobs = dupShown
     .filter((g) => g.files.length > 1)
-    .map((g) => ({ keep: g.files[0], remove: g.files.slice(1), size: g.size }));
+    .map((g) => {
+      const keep = keptPath(g);
+      return { keep, remove: g.files.filter((f) => f !== keep), size: g.size };
+    })
+    .filter((j) => j.remove.length > 0);
   if (!jobs.length) return;
-  if (!dryRun && !confirm(`Really ${action} ${jobs.reduce((a, j) => a + j.remove.length, 0)} file(s)?`)) return;
+  const count = jobs.reduce((a, j) => a + j.remove.length, 0);
+  if (!dryRun) {
+    const warn = action === "trash" ? "" : "  (irreversible!)";
+    if (!confirm(`${action} ${count} file(s)?${warn}`)) return;
+  }
 
-  setBusy(true, dryRun ? "Dry-run…" : "Reclaiming…");
+  setBusy(true, dryRun ? t("dryRun") + "…" : t("working"));
   try {
     const rep = await invoke("reclaim_dupes", { jobs, action, dryRun });
-    const tag = rep.dry_run ? "DRY-RUN (nothing changed)" : "done";
-    status(`${tag}: ${rep.removed} file(s), ${human(rep.reclaimed)} reclaimable` +
+    const tag = rep.dry_run ? "DRY-RUN" : "OK";
+    status(`${tag}: ${rep.removed} file(s), ${human(rep.reclaimed)} ${t("reclaimable")}` +
       (rep.errors.length ? `, ${rep.errors.length} error(s)` : ""));
-    if (!rep.dry_run) {
-      await doDupes(); // refresh after real changes
-    }
+    if (!rep.dry_run) await doDupes();
   } catch (e) {
     showError(e);
   } finally {
@@ -275,43 +422,29 @@ async function reclaimShown(dryRun) {
 async function browse() {
   try {
     const picked = await invoke("pick_folder");
-    if (picked) {
-      $("path").value = picked;
-      doScan();
-    }
+    if (picked) { $("path").value = picked; doScan(); }
   } catch (e) {
     showError(e);
   }
 }
 
+applyI18n();
 $("btn-scan").addEventListener("click", () => doScan());
 $("btn-dupes").addEventListener("click", () => doDupes());
 $("btn-browse").addEventListener("click", browse);
-$("path").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") doScan();
-});
-
+$("path").addEventListener("keydown", (e) => { if (e.key === "Enter") doScan(); });
 $("btn-cancel").addEventListener("click", async () => {
-  try {
-    await invoke("cancel");
-    status("Cancelling…");
-  } catch (_) {
-    /* ignore */
-  }
+  try { await invoke("cancel"); status(t("cancelling")); } catch (_) { /* ignore */ }
 });
 
-// Live progress events from the backend while a scan/search runs.
 try {
   window.__TAURI__?.event?.listen?.("progress", (e) => {
     if ($("results").classList.contains("loading") && e.payload) {
-      status(`Working… ${e.payload.files.toLocaleString()} files, ${human(e.payload.bytes)}`);
+      status(`${t("working")} ${e.payload.files.toLocaleString()} ${t("files")}, ${human(e.payload.bytes)}`);
     }
   });
-} catch (_) {
-  /* events not available; ignore */
-}
+} catch (_) { /* events unavailable */ }
 
-// Drag & drop a folder onto the window (Tauri webview event; guarded).
 try {
   const wv = window.__TAURI__?.webview?.getCurrentWebview?.();
   if (wv && wv.onDragDropEvent) {
@@ -322,6 +455,4 @@ try {
       }
     });
   }
-} catch (_) {
-  /* drag-drop not available; ignore */
-}
+} catch (_) { /* drag-drop unavailable */ }

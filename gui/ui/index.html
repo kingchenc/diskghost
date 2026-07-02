@@ -14,25 +14,25 @@
 
     <section class="controls" aria-label="Scan controls">
       <div class="pathrow">
-        <label class="sr-only" for="path">Folder path</label>
-        <input id="path" type="text" spellcheck="false"
-          placeholder="Paste a folder path, drop a folder here, or use Browse…" />
-        <button id="btn-browse" type="button">Browse…</button>
+        <label class="sr-only" for="path" data-i18n="pathLabel">Folder path</label>
+        <input id="path" type="text" spellcheck="false" data-i18n-ph="placeholder" />
+        <button id="btn-browse" type="button" data-i18n="browse">Browse…</button>
       </div>
       <div class="opts">
-        <label>Top <input id="top" type="number" value="20" min="1" max="1000" /></label>
-        <label>Min MB <input id="mb" type="number" value="1" min="0" max="1000000" /></label>
-        <label>Max depth <input id="depth" type="number" min="1" max="100" placeholder="∞" /></label>
-        <label>Exclude <input id="exclude" type="text" placeholder="node_modules, *.tmp" /></label>
-        <label class="chk"><input id="follow" type="checkbox" /> Follow symlinks</label>
+        <label><span data-i18n="top">Top</span> <input id="top" type="number" value="20" min="1" max="1000" /></label>
+        <label><span data-i18n="minmb">Min MB</span> <input id="mb" type="number" value="1" min="0" max="1000000" /></label>
+        <label><span data-i18n="depth">Max depth</span> <input id="depth" type="number" min="1" max="100" placeholder="∞" /></label>
+        <label><span data-i18n="exclude">Exclude</span> <input id="exclude" type="text" placeholder="node_modules, *.tmp" /></label>
+        <label class="chk"><input id="follow" type="checkbox" /> <span data-i18n="follow">Follow symlinks</span></label>
       </div>
       <div class="actions">
-        <button id="btn-scan" class="primary" type="button">Scan size</button>
-        <button id="btn-dupes" type="button">Find duplicates</button>
-        <button id="btn-cancel" class="danger" type="button" style="display: none">Cancel</button>
+        <button id="btn-scan" class="primary" type="button" data-i18n="scan">Scan size</button>
+        <button id="btn-dupes" type="button" data-i18n="dupes">Find duplicates</button>
+        <button id="btn-cancel" class="danger" type="button" style="display: none" data-i18n="cancel">Cancel</button>
       </div>
     </section>
 
+    <nav id="crumbs" class="crumbs" aria-label="Path breadcrumb"></nav>
     <div id="status" class="status" role="status" aria-live="polite"></div>
     <main id="results" tabindex="-1"></main>
 
