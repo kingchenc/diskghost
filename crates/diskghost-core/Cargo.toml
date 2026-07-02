@@ -12,4 +12,5 @@ description = "Fast parallel disk scanning and duplicate detection — the engin
 jwalk = "0.8"
 rayon = "1"
 blake3 = "1"
+same-file = "1"
 serde = { version = "1", features = ["derive"] }

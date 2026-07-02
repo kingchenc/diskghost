@@ -80,15 +80,26 @@ fn main() -> ExitCode {
 fn print_scan(r: &ScanReport) {
     println!("Scan of {}", r.root.display());
     println!(
-        "  total: {} across {} files in {} dirs\n",
+        "  total: {} across {} files in {} dirs",
         human_size(r.total_size),
         r.total_files,
         r.total_dirs
     );
+    if r.skipped > 0 {
+        println!("  skipped: {} unreadable entries (permissions?)", r.skipped);
+    }
+    println!();
 
     println!("Biggest sub-folders:");
     for d in &r.children {
         println!("  {:>10}  {}", human_size(d.size), d.path.display());
+    }
+    if r.root_files_count > 0 {
+        println!(
+            "  {:>10}  ({} file(s) directly in root)",
+            human_size(r.root_files_size),
+            r.root_files_count
+        );
     }
 
     println!("\nBiggest files:");
