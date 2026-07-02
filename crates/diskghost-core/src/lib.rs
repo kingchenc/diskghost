@@ -1,11 +1,14 @@
 //! diskghost-core — fast parallel disk scanning and duplicate detection.
 //!
-//! The engine behind Diskghost. Two jobs:
-//!   * [`scan`] — total size, biggest sub-folders and biggest files under a root.
-//!   * [`find_duplicates`] — byte-identical files, found cheaply and *correctly*:
-//!     group by size, collapse hard links (same physical file), pre-hash the
-//!     first block, then full-hash only the survivors (BLAKE3), all in parallel.
+//! The engine behind Diskghost:
+//!   * [`scan`] / [`scan_with`] — total size, biggest sub-folders and files.
+//!   * [`find_duplicates`] / [`find_duplicates_with`] — byte-identical files,
+//!     found cheaply and correctly (group by size, collapse hard links, pre-hash
+//!     the first block, then full-hash survivors with BLAKE3, all in parallel).
+//!   * [`reclaim`] — act on duplicates: delete, send to trash, or replace with a
+//!     hard link (dry-run by default at the call site).
 //!
+//! [`Options`] controls the walk: exclude globs, max depth, follow-symlinks.
 //! Everything is `serde`-serialisable so a CLI, a GUI or an agent can consume it.
 
 use std::collections::{HashMap, HashSet};
@@ -13,6 +16,18 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 use serde::Serialize;
+
+/// Options controlling how the filesystem is walked (shared by scan + dupes).
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    /// Maximum depth below the root (`None` = unlimited; `Some(1)` = root's children).
+    pub max_depth: Option<usize>,
+    /// Follow symbolic links / junctions (default `false` — avoids loops + surprises).
+    pub follow_symlinks: bool,
+    /// Glob patterns; a path is skipped if the glob matches the whole path, any
+    /// path component, or the file name (so `node_modules` and `*.tmp` both work).
+    pub exclude: Vec<String>,
+}
 
 /// A single file with its size in bytes.
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +73,26 @@ pub struct DupGroup {
     pub wasted: u64,
 }
 
+/// How to reclaim the space taken by redundant duplicate copies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimAction {
+    /// Permanently delete the redundant copies.
+    Delete,
+    /// Move the redundant copies to the OS trash / recycle bin.
+    Trash,
+    /// Delete the copy and recreate it as a hard link to the kept file.
+    Hardlink,
+}
+
+/// Outcome of a [`reclaim`] call.
+#[derive(Debug, Serialize)]
+pub struct ReclaimReport {
+    pub removed: usize,
+    pub reclaimed: u64,
+    pub errors: Vec<String>,
+    pub dry_run: bool,
+}
+
 /// First N bytes hashed as a cheap pre-filter before a full-file hash.
 const PREFIX_LEN: usize = 4096;
 
@@ -67,17 +102,53 @@ struct Walk {
     skipped: u64,
 }
 
+fn build_globset(patterns: &[String]) -> globset::GlobSet {
+    let mut builder = globset::GlobSetBuilder::new();
+    for p in patterns {
+        if let Ok(g) = globset::Glob::new(p) {
+            builder.add(g);
+        }
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| globset::GlobSet::empty())
+}
+
+/// True if `path` should be excluded: the glob matches the whole path, any
+/// component (e.g. a `node_modules` dir), or the file name (e.g. `*.tmp`).
+fn is_excluded(glob: &globset::GlobSet, path: &Path) -> bool {
+    if glob.is_empty() {
+        return false;
+    }
+    if glob.is_match(path) {
+        return true;
+    }
+    path.components().any(|c| glob.is_match(c.as_os_str()))
+}
+
 /// Walk `root` recursively in a single pass: collect files (with size), count
-/// directories, and count unreadable entries. Symlinks are not followed, so
-/// symlink loops cannot cause infinite recursion.
-fn walk(root: &Path) -> Walk {
+/// directories, and count unreadable entries, honouring [`Options`].
+fn walk(root: &Path, opts: &Options) -> Walk {
+    let glob = build_globset(&opts.exclude);
+
+    let mut wd = jwalk::WalkDir::new(root)
+        .skip_hidden(false)
+        .follow_links(opts.follow_symlinks);
+    if let Some(d) = opts.max_depth {
+        wd = wd.max_depth(d);
+    }
+
     let mut files = Vec::new();
     let mut dirs = 0u64;
     let mut skipped = 0u64;
 
-    for entry in jwalk::WalkDir::new(root).skip_hidden(false) {
+    for entry in wd {
         match entry {
             Ok(e) => {
+                let path = e.path();
+                if is_excluded(&glob, &path) {
+                    continue;
+                }
                 let ft = e.file_type();
                 if ft.is_dir() {
                     if e.depth() > 0 {
@@ -86,13 +157,12 @@ fn walk(root: &Path) -> Walk {
                 } else if ft.is_file() {
                     match e.metadata() {
                         Ok(m) => files.push(FileEntry {
-                            path: e.path(),
+                            path,
                             size: m.len(),
                         }),
                         Err(_) => skipped += 1,
                     }
                 }
-                // Unfollowed symlinks are ignored (see the follow-symlinks option, roadmap).
             }
             Err(_) => skipped += 1,
         }
@@ -105,20 +175,24 @@ fn walk(root: &Path) -> Walk {
     }
 }
 
-/// Walk `root` recursively and return every file with its size. I/O errors
-/// (permission denied, races) are skipped rather than aborting the whole scan.
+/// Walk `root` recursively and return every file with its size (default options).
 pub fn walk_files(root: &Path) -> Vec<FileEntry> {
-    walk(root).files
+    walk(root, &Options::default()).files
+}
+
+/// Scan `root` with default options. See [`scan_with`].
+pub fn scan(root: &Path, top_n: usize) -> ScanReport {
+    scan_with(root, top_n, &Options::default())
 }
 
 /// Scan `root`: total size, the `top_n` biggest immediate sub-folders, the bytes
-/// of files sitting directly in the root, and the `top_n` biggest individual files.
-pub fn scan(root: &Path, top_n: usize) -> ScanReport {
+/// of files directly in the root, and the `top_n` biggest individual files.
+pub fn scan_with(root: &Path, top_n: usize, opts: &Options) -> ScanReport {
     let Walk {
         files,
         dirs,
         skipped,
-    } = walk(root);
+    } = walk(root, opts);
 
     let total_size: u64 = files.iter().map(|f| f.size).sum();
     let total_files = files.len() as u64;
@@ -173,17 +247,19 @@ pub fn scan(root: &Path, top_n: usize) -> ScanReport {
     }
 }
 
-/// Find groups of byte-identical files under `root`, ignoring files smaller than
-/// `min_size` bytes and zero-byte files. Cheap and correct:
-///   1. group by size (a full hash is pointless unless sizes match);
-///   2. collapse hard links — entries pointing at the same physical file are not
-///      wasted space, so they are counted once;
-///   3. pre-hash the first [`PREFIX_LEN`] bytes to drop files that differ early;
-///   4. full-hash the survivors with BLAKE3.
-///
-/// Steps 2-4 run in parallel across size groups.
+/// Find duplicate files under `root` with default options. See [`find_duplicates_with`].
 pub fn find_duplicates(root: &Path, min_size: u64) -> Vec<DupGroup> {
-    let files: Vec<FileEntry> = walk(root)
+    find_duplicates_with(root, min_size, &Options::default())
+}
+
+/// Find groups of byte-identical files under `root`, ignoring files smaller than
+/// `min_size` bytes and zero-byte files.
+///
+/// Cheap and correct: group by size, collapse hard links, pre-hash the first
+/// [`PREFIX_LEN`] bytes, then full-hash the survivors (BLAKE3). Parallel across
+/// size groups.
+pub fn find_duplicates_with(root: &Path, min_size: u64, opts: &Options) -> Vec<DupGroup> {
+    let files: Vec<FileEntry> = walk(root, opts)
         .files
         .into_iter()
         .filter(|f| f.size >= min_size && f.size > 0)
@@ -200,13 +276,11 @@ pub fn find_duplicates(root: &Path, min_size: u64) -> Vec<DupGroup> {
     let mut groups: Vec<DupGroup> = candidates
         .par_iter()
         .flat_map(|(size, paths)| {
-            // (2) collapse hard links to distinct physical files
             let reps = dedup_hard_links(paths);
             if reps.len() < 2 {
                 return Vec::new();
             }
 
-            // (3) pre-hash first block
             let mut by_prefix: HashMap<[u8; 32], Vec<PathBuf>> = HashMap::new();
             for p in reps {
                 if let Ok(h) = hash_prefix(&p, PREFIX_LEN) {
@@ -214,7 +288,6 @@ pub fn find_duplicates(root: &Path, min_size: u64) -> Vec<DupGroup> {
                 }
             }
 
-            // (4) full-hash the survivors
             let mut out = Vec::new();
             for prefix_group in by_prefix.into_values() {
                 if prefix_group.len() < 2 {
@@ -247,11 +320,56 @@ pub fn find_duplicates(root: &Path, min_size: u64) -> Vec<DupGroup> {
     groups
 }
 
+/// Reclaim the space of redundant duplicate copies: keep `keep`, act on every
+/// path in `remove` (each assumed to be `size` bytes). When `dry_run` is true no
+/// filesystem changes are made — the report shows what *would* happen.
+pub fn reclaim(
+    keep: &Path,
+    remove: &[PathBuf],
+    size: u64,
+    action: ReclaimAction,
+    dry_run: bool,
+) -> ReclaimReport {
+    let mut removed = 0usize;
+    let mut reclaimed = 0u64;
+    let mut errors = Vec::new();
+
+    for p in remove {
+        if p == keep {
+            continue;
+        }
+        if dry_run {
+            removed += 1;
+            reclaimed = reclaimed.saturating_add(size);
+            continue;
+        }
+        let result: Result<(), String> = match action {
+            ReclaimAction::Delete => std::fs::remove_file(p).map_err(|e| e.to_string()),
+            ReclaimAction::Trash => trash::delete(p).map_err(|e| e.to_string()),
+            ReclaimAction::Hardlink => std::fs::remove_file(p)
+                .and_then(|_| std::fs::hard_link(keep, p))
+                .map_err(|e| e.to_string()),
+        };
+        match result {
+            Ok(()) => {
+                removed += 1;
+                reclaimed = reclaimed.saturating_add(size);
+            }
+            Err(e) => errors.push(format!("{}: {e}", p.display())),
+        }
+    }
+
+    ReclaimReport {
+        removed,
+        reclaimed,
+        errors,
+        dry_run,
+    }
+}
+
 /// Keep one path per distinct physical file. Hard links share a file identity,
 /// so they must not be counted as duplicates. [`same_file::Handle`] provides that
-/// identity cross-platform (device + inode on Unix, volume-serial + file-index on
-/// Windows). Paths whose identity can't be read are kept (we can't prove they are
-/// hard links).
+/// identity cross-platform. Paths whose identity can't be read are kept.
 fn dedup_hard_links(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut seen: HashSet<same_file::Handle> = HashSet::new();
     let mut reps = Vec::new();
@@ -358,8 +476,8 @@ mod tests {
             .all(|c| c.path.file_name().unwrap() != "loose.bin"));
         assert_eq!(r.root_files_count, 1);
         assert_eq!(r.root_files_size, 777);
-        assert_eq!(r.children.len(), 1); // only `sub`
-        assert_eq!(r.total_size, 1077); // both still counted
+        assert_eq!(r.children.len(), 1);
+        assert_eq!(r.total_size, 1077);
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -396,13 +514,68 @@ mod tests {
         );
         if std::fs::hard_link(&a, &b).is_err() {
             std::fs::remove_dir_all(&d).ok();
-            return; // filesystem doesn't support hard links; skip
+            return;
         }
         let groups = find_duplicates(&d, 1);
         assert!(
             groups.is_empty(),
             "hard links must not be reported as duplicates, got {groups:?}"
         );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn exclude_and_depth_options() {
+        let d = tmpdir("opts");
+        write(&d.join("keep.bin"), &[0u8; 100]);
+        write(&d.join("junk.tmp"), &[0u8; 1000]);
+        write(&d.join("nested/deep/deeper.bin"), &[0u8; 50]);
+
+        // Exclude *.tmp by name.
+        let opts = Options {
+            exclude: vec!["*.tmp".into()],
+            ..Default::default()
+        };
+        let r = scan_with(&d, 20, &opts);
+        assert_eq!(r.total_size, 150, "junk.tmp should be excluded");
+
+        // Depth 1: only the root's direct children are visited.
+        let shallow = Options {
+            max_depth: Some(1),
+            ..Default::default()
+        };
+        let r2 = scan_with(&d, 20, &shallow);
+        // deeper.bin (depth 3) must not be counted.
+        assert!(!r2.top_files.iter().any(|f| f.path.ends_with("deeper.bin")));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn reclaim_dry_run_then_delete() {
+        let d = tmpdir("reclaim");
+        let keep = d.join("keep.bin");
+        let dup1 = d.join("dup1.bin");
+        let dup2 = d.join("dup2.bin");
+        let body = b"reclaimable duplicate content, definitely long enough here";
+        write(&keep, body);
+        write(&dup1, body);
+        write(&dup2, body);
+        let size = body.len() as u64;
+        let remove = vec![dup1.clone(), dup2.clone()];
+
+        // Dry run: nothing deleted, but reported.
+        let dry = reclaim(&keep, &remove, size, ReclaimAction::Delete, true);
+        assert_eq!(dry.removed, 2);
+        assert_eq!(dry.reclaimed, 2 * size);
+        assert!(dry.errors.is_empty());
+        assert!(dup1.exists() && dup2.exists() && keep.exists());
+
+        // Real delete: dups gone, keep stays.
+        let done = reclaim(&keep, &remove, size, ReclaimAction::Delete, false);
+        assert_eq!(done.removed, 2);
+        assert_eq!(done.reclaimed, 2 * size);
+        assert!(done.errors.is_empty());
+        assert!(!dup1.exists() && !dup2.exists() && keep.exists());
         std::fs::remove_dir_all(&d).ok();
     }
 
