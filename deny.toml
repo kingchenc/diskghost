@@ -11,6 +11,5 @@ multiple-versions = "warn"
 wildcards = "warn"
 
 [sources]
-version = 2
 unknown-registry = "deny"
 unknown-git = "deny"

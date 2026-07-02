@@ -1,3 +1,7 @@
+# Own workspace root — the GUI is intentionally separate from the core/CLI
+# workspace so it isn't built/linted as part of `cargo … --workspace`.
+[workspace]
+
 [package]
 name = "diskghost-gui"
 version = "0.1.0"
