@@ -2,13 +2,28 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use diskghost_core::{
-    find_duplicates_with, reclaim, scan_with, DupGroup, Options, ReclaimAction, ReclaimReport,
-    ScanReport,
+    find_duplicates_with_progress, reclaim, scan_with_progress, DupGroup, Options, Progress,
+    ReclaimAction, ReclaimReport, ScanReport,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
+
+/// Holds the `Progress` of the operation currently running, so `cancel` can flag it.
+struct AppState {
+    current: Mutex<Progress>,
+}
+
+/// Payload pushed to the frontend as a scan/search runs.
+#[derive(Clone, Serialize)]
+struct ProgressPayload {
+    files: u64,
+    bytes: u64,
+}
 
 /// Walk options coming from the frontend.
 #[derive(Deserialize, Default)]
@@ -29,32 +44,107 @@ impl WalkOpts {
     }
 }
 
-/// Scan a directory (runs on a blocking thread so the UI stays responsive).
-#[tauri::command]
-async fn scan_dir(path: String, top: usize, opts: WalkOpts) -> Result<ScanReport, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let p = PathBuf::from(&path);
-        if !p.is_dir() {
-            return Err(format!("not a directory: {path}"));
+/// Emit a `progress` event every ~120 ms until `done` is set.
+fn spawn_emitter(app: tauri::AppHandle, progress: Progress, done: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        while !done.load(Ordering::Relaxed) {
+            let _ = app.emit(
+                "progress",
+                ProgressPayload {
+                    files: progress.files(),
+                    bytes: progress.bytes(),
+                },
+            );
+            std::thread::sleep(std::time::Duration::from_millis(120));
         }
-        Ok(scan_with(&p, top, &opts.into_options()))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    });
 }
 
-/// Find duplicate files under a directory (min size in MB).
+/// Register `progress` as the cancellable operation, drop the lock before await.
+fn register(state: &tauri::State<'_, AppState>, progress: &Progress) {
+    if let Ok(mut cur) = state.current.lock() {
+        *cur = progress.clone();
+    }
+}
+
+/// Scan a directory (blocking work off-thread; progress emitted live).
 #[tauri::command]
-async fn find_dupes(path: String, mb: u64, opts: WalkOpts) -> Result<Vec<DupGroup>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+async fn scan_dir(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+    top: usize,
+    opts: WalkOpts,
+) -> Result<ScanReport, String> {
+    let progress = Progress::default();
+    register(&state, &progress);
+    let opts = opts.into_options();
+    let done = Arc::new(AtomicBool::new(false));
+    spawn_emitter(app.clone(), progress.clone(), done.clone());
+
+    let job = progress.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
         let p = PathBuf::from(&path);
         if !p.is_dir() {
             return Err(format!("not a directory: {path}"));
         }
-        Ok(find_duplicates_with(&p, mb * 1024 * 1024, &opts.into_options()))
+        Ok(scan_with_progress(&p, top, &opts, &job))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    done.store(true, Ordering::Relaxed);
+    let _ = app.emit(
+        "progress",
+        ProgressPayload {
+            files: progress.files(),
+            bytes: progress.bytes(),
+        },
+    );
+    res
+}
+
+/// Find duplicate files (blocking work off-thread; progress emitted live).
+#[tauri::command]
+async fn find_dupes(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+    mb: u64,
+    opts: WalkOpts,
+) -> Result<Vec<DupGroup>, String> {
+    let progress = Progress::default();
+    register(&state, &progress);
+    let opts = opts.into_options();
+    let done = Arc::new(AtomicBool::new(false));
+    spawn_emitter(app.clone(), progress.clone(), done.clone());
+
+    let job = progress.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        if !p.is_dir() {
+            return Err(format!("not a directory: {path}"));
+        }
+        Ok(find_duplicates_with_progress(
+            &p,
+            mb * 1024 * 1024,
+            &opts,
+            &job,
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    done.store(true, Ordering::Relaxed);
+    res
+}
+
+/// Request cancellation of the currently running scan/search.
+#[tauri::command]
+fn cancel(state: tauri::State<'_, AppState>) {
+    if let Ok(cur) = state.current.lock() {
+        cur.cancel();
+    }
 }
 
 /// One reclaim job: keep `keep`, act on each path in `remove` (all `size` bytes).
@@ -65,8 +155,7 @@ struct ReclaimJob {
     size: u64,
 }
 
-/// Reclaim space across many duplicate groups. `action` is delete/trash/hardlink;
-/// `dry_run` reports what would happen without changing anything.
+/// Reclaim space across many duplicate groups. `action` is delete/trash/hardlink.
 #[tauri::command]
 async fn reclaim_dupes(
     jobs: Vec<ReclaimJob>,
@@ -106,20 +195,25 @@ async fn reclaim_dupes(
 #[tauri::command]
 async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
     let (tx, rx) = std::sync::mpsc::channel();
-    app.dialog()
-        .file()
-        .pick_folder(move |res| {
-            let _ = tx.send(res);
-        });
+    app.dialog().file().pick_folder(move |res| {
+        let _ = tx.send(res);
+    });
     rx.recv().ok().flatten().map(|p| p.to_string())
 }
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            app.manage(AppState {
+                current: Mutex::new(Progress::default()),
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             scan_dir,
             find_dupes,
+            cancel,
             reclaim_dupes,
             pick_folder
         ])

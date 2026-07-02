@@ -41,9 +41,13 @@ function status(msg) {
 
 function setBusy(busy, msg) {
   status(msg);
-  const r = $("results");
-  r.classList.toggle("loading", busy);
-  for (const b of document.querySelectorAll("button, input")) b.disabled = busy;
+  $("results").classList.toggle("loading", busy);
+  for (const b of document.querySelectorAll("button, input")) {
+    if (b.id === "btn-cancel") continue; // stays clickable so you can cancel
+    b.disabled = busy;
+  }
+  const c = $("btn-cancel");
+  if (c) c.style.display = busy ? "" : "none";
 }
 
 function showError(msg) {
@@ -271,6 +275,26 @@ $("btn-browse").addEventListener("click", browse);
 $("path").addEventListener("keydown", (e) => {
   if (e.key === "Enter") doScan();
 });
+
+$("btn-cancel").addEventListener("click", async () => {
+  try {
+    await invoke("cancel");
+    status("Cancelling…");
+  } catch (_) {
+    /* ignore */
+  }
+});
+
+// Live progress events from the backend while a scan/search runs.
+try {
+  window.__TAURI__?.event?.listen?.("progress", (e) => {
+    if ($("results").classList.contains("loading") && e.payload) {
+      status(`Working… ${e.payload.files.toLocaleString()} files, ${human(e.payload.bytes)}`);
+    }
+  });
+} catch (_) {
+  /* events not available; ignore */
+}
 
 // Drag & drop a folder onto the window (Tauri webview event; guarded).
 try {
