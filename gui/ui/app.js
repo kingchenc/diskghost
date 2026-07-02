@@ -146,6 +146,9 @@ function renderScan(r) {
       el("span", { class: "sz", text: human(f.size) }),
       el("span", { class: "path", text: f.path })));
   }
+  if (r.top_files.length > RENDER_CAP) {
+    files.append(el("div", { class: "muted", text: `… showing ${RENDER_CAP} of ${r.top_files.length} files` }));
+  }
   frag.append(files);
 
   results.replaceChildren(frag);
@@ -172,33 +175,46 @@ async function doDupes() {
   }
 }
 
+let dupShown = []; // groups currently shown (after filter/sort) — used by reclaim
+
 function renderDupes() {
   const results = $("results");
   if (!lastGroups.length) {
     results.replaceChildren(el("div", { class: "ok" }, "No duplicates found 🎉"));
     return;
   }
-
-  const filter = $("dupfilter")?.value?.toLowerCase() || "";
-  const sort = $("dupsort")?.value || "wasted";
-  let groups = lastGroups.filter((g) => !filter || g.files.some((f) => f.toLowerCase().includes(filter)));
-  groups.sort((a, b) =>
-    sort === "size" ? b.size - a.size : sort === "count" ? b.files.length - a.files.length : b.wasted - a.wasted);
-
   const totalWasted = lastGroups.reduce((a, g) => a + g.wasted, 0);
-  const frag = document.createDocumentFragment();
 
-  // toolbar
+  // The toolbar is built ONCE. Typing in the filter only updates the list below,
+  // so the input keeps focus + caret (rebuilding it would drop them each keystroke).
   const bar = el("div", { class: "dupbar" },
     el("div", { class: "ok", text: `${lastGroups.length} groups — ${human(totalWasted)} reclaimable` }),
-    labelled("Filter", el("input", { id: "dupfilter", type: "text", value: filter, oninput: renderDupes })),
-    labelled("Sort", selectEl("dupsort", sort, [["wasted", "wasted"], ["size", "size"], ["count", "count"]], renderDupes)),
+    labelled("Filter", el("input", { id: "dupfilter", type: "text", oninput: updateDupeList })),
+    labelled("Sort", selectEl("dupsort", "wasted", [["wasted", "wasted"], ["size", "size"], ["count", "count"]], updateDupeList)),
     selectEl("dupaction", "trash", [["trash", "→ Trash"], ["delete", "Delete"], ["hardlink", "Hard-link"]]),
-    el("button", { type: "button", onclick: () => reclaimShown(groups, true) }, "Dry-run"),
-    el("button", { class: "danger", type: "button", onclick: () => reclaimShown(groups, false) }, "Reclaim shown"));
-  frag.append(bar);
+    el("button", { type: "button", onclick: () => reclaimShown(true) }, "Dry-run"),
+    el("button", { class: "danger", type: "button", onclick: () => reclaimShown(false) }, "Reclaim shown"));
 
   const list = el("div", { class: "dupes" });
+  results.replaceChildren(bar, list);
+  updateDupeList();
+}
+
+function computeShown() {
+  const filter = $("dupfilter")?.value?.toLowerCase() || "";
+  const sort = $("dupsort")?.value || "wasted";
+  const groups = lastGroups.filter((g) => !filter || g.files.some((f) => f.toLowerCase().includes(filter)));
+  groups.sort((a, b) =>
+    sort === "size" ? b.size - a.size : sort === "count" ? b.files.length - a.files.length : b.wasted - a.wasted);
+  dupShown = groups;
+  return groups;
+}
+
+function updateDupeList() {
+  const list = document.querySelector(".dupes");
+  if (!list) return;
+  const groups = computeShown();
+  const frag = document.createDocumentFragment();
   for (const g of groups.slice(0, RENDER_CAP)) {
     const box = el("div", { class: "dup" });
     box.append(el("div", { class: "dhead" },
@@ -209,13 +225,12 @@ function renderDupes() {
       box.append(el("div", { class: "path small" + (i === 0 ? " keep" : "") },
         (i === 0 ? "keep  " : "dup   ") + f));
     });
-    list.append(box);
+    frag.append(box);
   }
   if (groups.length > RENDER_CAP) {
-    list.append(el("div", { class: "muted", text: `… showing ${RENDER_CAP} of ${groups.length} groups` }));
+    frag.append(el("div", { class: "muted", text: `… showing ${RENDER_CAP} of ${groups.length} groups` }));
   }
-  frag.append(list);
-  results.replaceChildren(frag);
+  list.replaceChildren(frag);
 }
 
 function labelled(text, input) {
@@ -232,9 +247,9 @@ function selectEl(id, value, options, onchange) {
   return s;
 }
 
-async function reclaimShown(groups, dryRun) {
+async function reclaimShown(dryRun) {
   const action = $("dupaction")?.value || "trash";
-  const jobs = groups
+  const jobs = dupShown
     .filter((g) => g.files.length > 1)
     .map((g) => ({ keep: g.files[0], remove: g.files.slice(1), size: g.size }));
   if (!jobs.length) return;

@@ -332,6 +332,9 @@ pub fn find_duplicates_with_progress(
     let mut groups: Vec<DupGroup> = candidates
         .par_iter()
         .flat_map(|(size, paths)| {
+            if progress.cancelled() {
+                return Vec::new(); // stop hashing new groups once cancelled
+            }
             let reps = dedup_hard_links(paths);
             if reps.len() < 2 {
                 return Vec::new();
@@ -359,6 +362,8 @@ pub fn find_duplicates_with_progress(
                     if group.len() < 2 {
                         continue;
                     }
+                    let mut group = group;
+                    group.sort(); // stable order so "keep the first" is deterministic
                     let wasted = size.saturating_mul(group.len() as u64 - 1);
                     out.push(DupGroup {
                         hash,
@@ -402,9 +407,20 @@ pub fn reclaim(
         let result: Result<(), String> = match action {
             ReclaimAction::Delete => std::fs::remove_file(p).map_err(|e| e.to_string()),
             ReclaimAction::Trash => trash::delete(p).map_err(|e| e.to_string()),
-            ReclaimAction::Hardlink => std::fs::remove_file(p)
-                .and_then(|_| std::fs::hard_link(keep, p))
-                .map_err(|e| e.to_string()),
+            ReclaimAction::Hardlink => {
+                // Safe order: hard-link to a temp name, then atomically replace `p`.
+                // If linking fails (e.g. different volume), `p` is left untouched —
+                // no data-loss window like a remove-then-link would have.
+                let mut tmp = p.clone().into_os_string();
+                tmp.push(".dghtmp");
+                let tmp = PathBuf::from(tmp);
+                std::fs::hard_link(keep, &tmp)
+                    .and_then(|_| std::fs::rename(&tmp, p))
+                    .map_err(|e| {
+                        let _ = std::fs::remove_file(&tmp);
+                        e.to_string()
+                    })
+            }
         };
         match result {
             Ok(()) => {
@@ -652,6 +668,55 @@ mod tests {
         c.cancel();
         let r2 = scan_with_progress(&d, 10, &Options::default(), &c);
         assert_eq!(r2.total_files, 0);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn reclaim_hardlink_dedups_without_loss() {
+        let d = tmpdir("reclaimhl");
+        let keep = d.join("keep.bin");
+        let dup = d.join("dup.bin");
+        let body = b"hardlink reclaim content, long enough to be a real file here";
+        write(&keep, body);
+        write(&dup, body);
+        let rep = reclaim(
+            &keep,
+            std::slice::from_ref(&dup),
+            body.len() as u64,
+            ReclaimAction::Hardlink,
+            false,
+        );
+        // On filesystems without hard links this errors — but never loses data.
+        if rep.errors.is_empty() {
+            assert_eq!(rep.removed, 1);
+            assert!(keep.exists() && dup.exists());
+            assert!(
+                find_duplicates(&d, 1).is_empty(),
+                "should be hard-linked now"
+            );
+        } else {
+            assert!(dup.exists(), "dup must survive a failed hardlink reclaim");
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn reclaim_skips_keep_listed_in_remove() {
+        let d = tmpdir("reclaimkeep");
+        let keep = d.join("k.bin");
+        let dup = d.join("d.bin");
+        write(&keep, b"content long enough to matter for this test case");
+        write(&dup, b"content long enough to matter for this test case");
+        let rep = reclaim(
+            &keep,
+            &[keep.clone(), dup.clone()],
+            40,
+            ReclaimAction::Delete,
+            false,
+        );
+        assert_eq!(rep.removed, 1);
+        assert!(keep.exists());
+        assert!(!dup.exists());
         std::fs::remove_dir_all(&d).ok();
     }
 

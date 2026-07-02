@@ -60,6 +60,15 @@ fn spawn_emitter(app: tauri::AppHandle, progress: Progress, done: Arc<AtomicBool
     });
 }
 
+/// Sets the `done` flag when dropped, so the emitter thread always stops — even
+/// if the scan job panics and the command returns early via `?`.
+struct DoneGuard(Arc<AtomicBool>);
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Register `progress` as the cancellable operation, drop the lock before await.
 fn register(state: &tauri::State<'_, AppState>, progress: &Progress) {
     if let Ok(mut cur) = state.current.lock() {
@@ -80,7 +89,8 @@ async fn scan_dir(
     register(&state, &progress);
     let opts = opts.into_options();
     let done = Arc::new(AtomicBool::new(false));
-    spawn_emitter(app.clone(), progress.clone(), done.clone());
+    let _done = DoneGuard(done.clone());
+    spawn_emitter(app.clone(), progress.clone(), done);
 
     let job = progress.clone();
     let res = tauri::async_runtime::spawn_blocking(move || {
@@ -93,7 +103,6 @@ async fn scan_dir(
     .await
     .map_err(|e| e.to_string())?;
 
-    done.store(true, Ordering::Relaxed);
     let _ = app.emit(
         "progress",
         ProgressPayload {
@@ -117,7 +126,8 @@ async fn find_dupes(
     register(&state, &progress);
     let opts = opts.into_options();
     let done = Arc::new(AtomicBool::new(false));
-    spawn_emitter(app.clone(), progress.clone(), done.clone());
+    let _done = DoneGuard(done.clone());
+    spawn_emitter(app.clone(), progress.clone(), done);
 
     let job = progress.clone();
     let res = tauri::async_runtime::spawn_blocking(move || {
@@ -135,7 +145,6 @@ async fn find_dupes(
     .await
     .map_err(|e| e.to_string())?;
 
-    done.store(true, Ordering::Relaxed);
     res
 }
 
@@ -194,11 +203,16 @@ async fn reclaim_dupes(
 /// Open a native folder picker. Returns the chosen path, or `None` if cancelled.
 #[tauri::command]
 async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    app.dialog().file().pick_folder(move |res| {
-        let _ = tx.send(res);
-    });
-    rx.recv().ok().flatten().map(|p| p.to_string())
+    // Run the blocking picker off the async executor thread (avoids blocking it).
+    tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .blocking_pick_folder()
+            .map(|p| p.to_string())
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn main() {
