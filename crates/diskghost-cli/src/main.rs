@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use diskghost_core::{
-    find_duplicates_with_progress, human_size, reclaim, scan_with_progress, validate_globs,
-    DupGroup, Options, Progress, ReclaimAction, ScanReport,
+    find_duplicates_with_progress, human_size, reclaim, remove_path, scan_with_progress,
+    validate_globs, DupGroup, Options, Progress, ReclaimAction, RemoveMode, RemoveReport,
+    ScanReport,
 };
 
 /// Run `job` with a `Progress`, printing a live line to stderr while it works
@@ -94,6 +95,17 @@ enum Command {
         #[arg(long, value_enum)]
         reclaim: Option<ReclaimArg>,
         /// Actually perform the reclaim (default: dry-run).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Delete a file or folder — permanently, or to the OS trash. Dry-run by default.
+    Rm {
+        /// File or directory to remove.
+        path: PathBuf,
+        /// Send to the OS trash / recycle bin (reversible) instead of deleting.
+        #[arg(long)]
+        trash: bool,
+        /// Actually remove (default: dry-run that only reports what would go).
         #[arg(long)]
         apply: bool,
     },
@@ -187,9 +199,60 @@ fn main() -> ExitCode {
                 run_reclaim(&groups, arg.into(), !apply);
             }
         }
+        Command::Rm { path, trash, apply } => {
+            if !path.exists() {
+                eprintln!("error: no such path: {}", path.display());
+                return ExitCode::FAILURE;
+            }
+            // Refuse a filesystem / drive root (e.g. `/` or `C:\`) — a path with
+            // no parent — so a stray `rm C:\ --apply` can't nuke the volume.
+            if path.parent().is_none() {
+                eprintln!(
+                    "error: refusing to remove a filesystem root: {}",
+                    path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+            let mode = if trash {
+                RemoveMode::Trash
+            } else {
+                RemoveMode::Delete
+            };
+            let report = with_progress(|p| remove_path(&path, mode, !apply, p));
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            } else {
+                print_remove(&report, trash);
+            }
+            if !report.errors.is_empty() {
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     ExitCode::SUCCESS
+}
+
+fn print_remove(r: &RemoveReport, trash: bool) {
+    let dest = if trash { "trash" } else { "delete" };
+    let what = format!(
+        "{} file(s), {} dir(s), {}",
+        r.files,
+        r.dirs,
+        human_size(r.bytes)
+    );
+    if r.dry_run {
+        println!("DRY-RUN [{dest}] {}: would remove {what}", r.root.display());
+        println!("  pass --apply to actually remove");
+    } else {
+        println!("[{dest}] {}: removed {what}", r.root.display());
+    }
+    for e in &r.errors {
+        eprintln!("  ! {e}");
+    }
+    if !r.errors.is_empty() {
+        eprintln!("  {} error(s)", r.errors.len());
+    }
 }
 
 fn print_scan(r: &ScanReport) {

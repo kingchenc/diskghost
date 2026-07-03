@@ -124,6 +124,29 @@ pub struct ReclaimReport {
     pub dry_run: bool,
 }
 
+/// How to remove a path with [`remove_path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveMode {
+    /// Permanently delete (files unlinked in parallel for speed).
+    Delete,
+    /// Move to the OS trash / recycle bin (reversible).
+    Trash,
+}
+
+/// Outcome of a [`remove_path`] call.
+#[derive(Debug, Serialize)]
+pub struct RemoveReport {
+    pub root: PathBuf,
+    /// Files removed (or, in a dry run, that would be removed).
+    pub files: u64,
+    /// Directories removed (or that would be).
+    pub dirs: u64,
+    /// Total bytes freed (or that would be).
+    pub bytes: u64,
+    pub errors: Vec<String>,
+    pub dry_run: bool,
+}
+
 /// First N bytes hashed as a cheap pre-filter before a full-file hash.
 const PREFIX_LEN: usize = 4096;
 
@@ -450,6 +473,123 @@ pub fn reclaim(
     }
 }
 
+/// Remove a file or an entire directory tree — permanently, or to the OS trash.
+///
+/// Symlinks and junctions are never followed, so the operation can never escape
+/// `path` and touch files outside the tree. When `dry_run` is true nothing is
+/// changed; the report tells you how many files/dirs and how many bytes *would*
+/// be removed. Permanent deletion unlinks files in parallel (rayon) for speed on
+/// large trees, then removes the now-empty directories deepest-first. Trash moves
+/// the whole path to the recycle bin in a single OS call (already fast, so it is
+/// not parallelised). Cancellation via [`Progress`] is honoured between files.
+pub fn remove_path(
+    path: &Path,
+    mode: RemoveMode,
+    dry_run: bool,
+    progress: &Progress,
+) -> RemoveReport {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut bytes = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+
+    let top = std::fs::symlink_metadata(path);
+    let is_dir = top.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+
+    if is_dir {
+        // Enumerate the tree once (never following links). jwalk yields the root
+        // itself at depth 0, so `dirs` includes it and the deepest-first removal
+        // below takes the root down last.
+        for entry in jwalk::WalkDir::new(path)
+            .skip_hidden(false)
+            .follow_links(false)
+        {
+            if progress.cancelled() {
+                break;
+            }
+            // Unreadable entries (Err) are simply skipped.
+            if let Ok(e) = entry {
+                if e.file_type().is_dir() {
+                    dirs.push(e.path());
+                } else {
+                    if let Ok(m) = e.metadata() {
+                        bytes = bytes.saturating_add(m.len());
+                    }
+                    files.push(e.path());
+                }
+            }
+        }
+    } else {
+        // A single file (or a symlink): remove just that entry.
+        if let Ok(m) = &top {
+            bytes = m.len();
+        }
+        files.push(path.to_path_buf());
+    }
+
+    let n_files = files.len() as u64;
+    let n_dirs = dirs.len() as u64;
+
+    if dry_run {
+        return RemoveReport {
+            root: path.to_path_buf(),
+            files: n_files,
+            dirs: n_dirs,
+            bytes,
+            errors,
+            dry_run: true,
+        };
+    }
+
+    match mode {
+        RemoveMode::Trash => {
+            if let Err(e) = trash::delete(path) {
+                errors.push(format!("{}: {e}", path.display()));
+            } else {
+                progress.files.fetch_add(n_files, Ordering::Relaxed);
+            }
+        }
+        RemoveMode::Delete => {
+            // Unlink files in parallel. `remove_file` handles files and file/dir
+            // symlinks on Unix; the `remove_dir` fallback covers Windows dir
+            // junctions that jwalk reported as non-dir entries.
+            let file_errors: Vec<String> = files
+                .par_iter()
+                .filter_map(|f| {
+                    if progress.cancelled() {
+                        return None;
+                    }
+                    match std::fs::remove_file(f).or_else(|_| std::fs::remove_dir(f)) {
+                        Ok(()) => {
+                            progress.files.fetch_add(1, Ordering::Relaxed);
+                            None
+                        }
+                        Err(e) => Some(format!("{}: {e}", f.display())),
+                    }
+                })
+                .collect();
+            errors.extend(file_errors);
+
+            // Remove directories deepest-first so each is empty when removed.
+            dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+            for d in &dirs {
+                if let Err(e) = std::fs::remove_dir(d) {
+                    errors.push(format!("{}: {e}", d.display()));
+                }
+            }
+        }
+    }
+
+    RemoveReport {
+        root: path.to_path_buf(),
+        files: n_files,
+        dirs: n_dirs,
+        bytes,
+        errors,
+        dry_run: false,
+    }
+}
+
 /// Keep one path per distinct physical file. Hard links share a file identity,
 /// so they must not be counted as duplicates. [`same_file::Handle`] provides that
 /// identity cross-platform. Paths whose identity can't be read are kept.
@@ -737,5 +877,47 @@ mod tests {
         assert_eq!(human_size(1023), "1023 B");
         assert_eq!(human_size(1024), "1.0 KB");
         assert_eq!(human_size(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn remove_dry_run_counts_but_keeps_everything() {
+        let d = tmpdir("rmdry");
+        write(&d.join("a/1.bin"), &[0u8; 1000]);
+        write(&d.join("a/b/2.bin"), &[0u8; 500]);
+        write(&d.join("3.bin"), &[0u8; 200]);
+        let rep = remove_path(&d, RemoveMode::Delete, true, &Progress::default());
+        assert!(rep.dry_run);
+        assert_eq!(rep.files, 3);
+        assert_eq!(rep.bytes, 1700);
+        assert!(rep.dirs >= 2); // root + a + a/b (root counted by jwalk)
+        assert!(rep.errors.is_empty());
+        assert!(d.exists()); // nothing was touched
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn remove_delete_wipes_the_whole_tree() {
+        let d = tmpdir("rmdel");
+        write(&d.join("a/1.bin"), &[0u8; 1000]);
+        write(&d.join("a/b/2.bin"), &[0u8; 500]);
+        write(&d.join("3.bin"), &[0u8; 200]);
+        let rep = remove_path(&d, RemoveMode::Delete, false, &Progress::default());
+        assert!(!rep.dry_run);
+        assert_eq!(rep.files, 3);
+        assert!(rep.errors.is_empty(), "errors: {:?}", rep.errors);
+        assert!(!d.exists(), "tree should be gone");
+    }
+
+    #[test]
+    fn remove_single_file() {
+        let d = tmpdir("rmfile");
+        let f = d.join("only.bin");
+        write(&f, &[0u8; 321]);
+        let rep = remove_path(&f, RemoveMode::Delete, false, &Progress::default());
+        assert_eq!(rep.files, 1);
+        assert_eq!(rep.bytes, 321);
+        assert!(!f.exists());
+        assert!(d.exists()); // parent left intact
+        std::fs::remove_dir_all(&d).ok();
     }
 }

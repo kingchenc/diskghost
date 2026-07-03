@@ -46,6 +46,12 @@ diskghost dupes "D:\Media" --min-mb 5
 diskghost dupes "D:\Media" --min-mb 5 --reclaim trash          # shows what would happen
 diskghost dupes "D:\Media" --min-mb 5 --reclaim trash --apply  # actually acts
 #   --reclaim delete | trash | hardlink   (one file per group is always kept)
+
+# Delete a file or folder — dry-run first (default), then apply
+diskghost rm "D:\old_project\target"            # shows how many files/dirs/bytes would go
+diskghost rm "D:\old_project\target" --apply    # permanently delete (files unlinked in parallel)
+diskghost rm "D:\old_project\target" --trash --apply   # send to the OS recycle bin instead
+#   never follows symlinks (can't escape the target); refuses a drive root
 ```
 
 ### Headless / agent mode
@@ -97,7 +103,8 @@ Diskghost/
 - [x] CLI with human + JSON output, scan options, reclaim (delete/trash/hardlink)
 - [x] Live progress + cancellation
 - [x] Modern GUI: treemap, folder picker, drag &amp; drop, one-click reclaim
-- [x] CI (fmt/clippy/test/bench on 3 OS) + signed release binaries
+- [x] Delete files/folders (CLI `rm` + GUI) — permanent or to the OS trash, parallel unlink
+- [x] CI (fmt/clippy/test/bench on 3 OS) + signed release binaries + GUI installers
 - [ ] Interactive treemap drill-up / breadcrumbs
 - [ ] Scheduled scans &amp; "what grew since last time"
 

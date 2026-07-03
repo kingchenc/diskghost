@@ -21,6 +21,9 @@ const I18N = {
     filter: "Filter", sort: "Sort", dryRun: "Dry-run", reclaimShown: "Reclaim shown",
     enterPath: "Enter a folder path.", working: "Working…", cancelling: "Cancelling…",
     showing: "showing", of: "of", keep: "keep",
+    trashMode: "Delete → Recycle Bin", del: "Delete", deleting: "Removing…",
+    removedMsg: "removed", errors: "error(s)",
+    confirmTrash: "Move to the Recycle Bin?", confirmDelete: "PERMANENTLY delete?",
   },
   de: {
     pathLabel: "Ordnerpfad", browse: "Durchsuchen…", top: "Top", minmb: "Min MB",
@@ -34,6 +37,9 @@ const I18N = {
     filter: "Filter", sort: "Sortierung", dryRun: "Testlauf", reclaimShown: "Ausgewählte freigeben",
     enterPath: "Ordnerpfad eingeben.", working: "Arbeite…", cancelling: "Breche ab…",
     showing: "zeige", of: "von", keep: "behalten",
+    trashMode: "Löschen → Papierkorb", del: "Löschen", deleting: "Entferne…",
+    removedMsg: "entfernt", errors: "Fehler",
+    confirmTrash: "In den Papierkorb verschieben?", confirmDelete: "ENDGÜLTIG löschen?",
   },
 };
 const LANG = (navigator.language || "en").toLowerCase().startsWith("de") ? "de" : "en";
@@ -137,6 +143,43 @@ async function doScan(pathOverride) {
   }
 }
 
+// -------------------------------- delete ----------------------------------
+// Remove a file/folder. The trash-mode checkbox (default on) routes it to the
+// OS Recycle Bin (reversible); unchecked deletes permanently. Always confirms,
+// then rescans the current view so the freed space shows immediately.
+async function deletePath(path) {
+  const trash = $("trashmode") ? $("trashmode").checked : true;
+  const question = trash ? t("confirmTrash") : t("confirmDelete");
+  if (!window.confirm(`${question}\n\n${path}`)) return;
+
+  let msg = "";
+  setBusy(true, t("deleting"));
+  try {
+    const r = await invoke("remove_path_cmd", { path, trash, apply: true });
+    msg = `${t("del")}: ${r.files} ${t("files")}, ${human(r.bytes)} ${t("removedMsg")}`;
+    if (r.errors && r.errors.length) msg += ` — ${r.errors.length} ${t("errors")}`;
+  } catch (e) {
+    setBusy(false, "");
+    return showError(e);
+  }
+  // Refresh the current scan (doScan manages its own busy state + resets status).
+  const cur = ($("path").value || "").trim();
+  if (cur) {
+    try { await doScan(cur); } catch (_) { /* keep the delete result message */ }
+  }
+  setBusy(false, "");
+  status(msg);
+}
+
+// Small trash button shared by folder + file rows.
+function delButton(path) {
+  return el("button", {
+    class: "del", type: "button", title: t("del"),
+    style: { flex: "0 0 auto", marginLeft: "6px", padding: "2px 6px", cursor: "pointer" },
+    onclick: (ev) => { ev.stopPropagation(); deletePath(path); },
+  }, "🗑");
+}
+
 function stat(label, value) {
   return el("div", { class: "stat" }, el("div", { class: "v", text: value }), el("div", { class: "l", text: label }));
 }
@@ -175,7 +218,7 @@ function renderScan(r) {
     fill.style.width = `${Math.max(2, (100 * d.size) / max)}%`;
     const bar = el("button", { class: "bar", type: "button", title: baseName(d.path), onclick: () => doScan(d.path) },
       fill, el("span", { class: "path", text: d.path }));
-    bars.append(el("div", { class: "row" }, bar, el("div", { class: "sz", text: human(d.size) })));
+    bars.append(el("div", { class: "row" }, bar, el("div", { class: "sz", text: human(d.size) }), delButton(d.path)));
   }
   if (r.root_files_count > 0) {
     bars.append(el("div", { class: "row muted" },
@@ -191,7 +234,8 @@ function renderScan(r) {
   virtualList(vbox, r.top_files, 34, (f) =>
     el("div", { class: "frow" },
       el("span", { class: "sz", text: human(f.size) }),
-      el("span", { class: "path", text: f.path })));
+      el("span", { class: "path", text: f.path }),
+      delButton(f.path)));
 }
 
 // Squarified treemap into `container` (must already be in the DOM so we can read

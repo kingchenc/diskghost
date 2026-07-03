@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use diskghost_core::{
-    find_duplicates_with_progress, reclaim, scan_with_progress, DupGroup, Options, Progress,
-    ReclaimAction, ReclaimReport, ScanReport,
+    find_duplicates_with_progress, reclaim, remove_path, scan_with_progress, DupGroup, Options,
+    Progress, ReclaimAction, ReclaimReport, RemoveMode, RemoveReport, ScanReport,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
@@ -200,6 +200,43 @@ async fn reclaim_dupes(
     .map_err(|e| e.to_string())?
 }
 
+/// Remove a file or folder — permanently or to the OS trash. `apply=false` is a
+/// dry run that only reports what would go. Progress is emitted live and the
+/// operation is cancellable. Refuses a filesystem root as a safety net.
+#[tauri::command]
+async fn remove_path_cmd(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+    trash: bool,
+    apply: bool,
+) -> Result<RemoveReport, String> {
+    let progress = Progress::default();
+    register(&state, &progress);
+    let done = Arc::new(AtomicBool::new(false));
+    let _done = DoneGuard(done.clone());
+    spawn_emitter(app.clone(), progress.clone(), done);
+
+    let job = progress.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        if !p.exists() {
+            return Err(format!("no such path: {path}"));
+        }
+        if p.parent().is_none() {
+            return Err(format!("refusing to remove a filesystem root: {path}"));
+        }
+        let mode = if trash {
+            RemoveMode::Trash
+        } else {
+            RemoveMode::Delete
+        };
+        Ok(remove_path(&p, mode, !apply, &job))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Open a native folder picker. Returns the chosen path, or `None` if cancelled.
 #[tauri::command]
 async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
@@ -229,6 +266,7 @@ fn main() {
             find_dupes,
             cancel,
             reclaim_dupes,
+            remove_path_cmd,
             pick_folder
         ])
         .run(tauri::generate_context!())
