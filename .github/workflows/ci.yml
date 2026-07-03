@@ -34,14 +34,21 @@ jobs:
         run: cargo build --workspace --release
 
   gui:
-    name: gui (tauri)
-    runs-on: ubuntu-latest
+    name: gui (tauri) • ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Install Tauri system dependencies
+      # Tauri needs GTK/WebKit dev headers only on Linux; Windows ships
+      # WebView2 and macOS ships WKWebView, so no system deps there.
+      - name: Install Tauri system dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \

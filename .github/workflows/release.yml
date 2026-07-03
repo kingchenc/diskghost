@@ -10,22 +10,45 @@ permissions:
   attestations: write
 
 jobs:
-  build:
-    name: ${{ matrix.target }}
+  cli:
+    name: cli • ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Linux
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: "" }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, ext: "" }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, ext: "" }
+          # Windows
           - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc, ext: ".exe" }
+          # macOS (arm64 native + Intel native on the x86 runner image)
           - { os: macos-latest, target: aarch64-apple-darwin, ext: "" }
+          - { os: macos-13, target: x86_64-apple-darwin, ext: "" }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+
+      # Cross-compilation toolchains for the non-native Linux targets.
+      # aarch64 needs a cross gcc as the linker; musl needs musl-tools.
+      # The other targets build natively on their runner image.
+      - name: Install Linux cross toolchain
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          fi
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            sudo apt-get install -y musl-tools
+          fi
 
       - name: Build CLI (release)
         run: cargo build --release -p diskghost-cli --target ${{ matrix.target }}
@@ -53,3 +76,58 @@ jobs:
           files: |
             diskghost-${{ matrix.target }}${{ matrix.ext }}
             diskghost-${{ matrix.target }}${{ matrix.ext }}.sha256
+
+  gui:
+    name: gui bundle • ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Native bundle per OS/arch: .AppImage/.deb/.rpm (Linux),
+        # .msi/.exe (Windows), .dmg for both Apple Silicon (macos-latest)
+        # and Intel (macos-13). Bundles are unsigned (no signing certs).
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-13]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Tauri system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "gui/src-tauri -> target"
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Build GUI bundles
+        working-directory: gui/src-tauri
+        run: cargo tauri build
+
+      - name: Collect bundles
+        shell: bash
+        run: |
+          mkdir -p dist
+          find gui/src-tauri/target/release/bundle -type f \
+            \( -name "*.dmg" -o -name "*.app.tar.gz" \
+               -o -name "*.msi" -o -name "*-setup.exe" \
+               -o -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \) \
+            -exec cp {} dist/ \;
+          ls -la dist
+
+      - name: Attest bundle provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: dist/*
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
