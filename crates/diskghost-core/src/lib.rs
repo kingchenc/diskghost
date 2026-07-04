@@ -199,23 +199,36 @@ fn is_excluded(glob: &globset::GlobSet, path: &Path) -> bool {
 fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
     let glob = Arc::new(build_globset(&opts.exclude));
 
-    let mut wd = jwalk::WalkDir::new(root)
+    // Each file's size is cached in the entry's client_state (Some(size), or
+    // None if the stat failed) so it can be read on the parallel walk threads
+    // instead of one-at-a-time in the serial consumer below. This is the
+    // scan's hot path: statting hundreds of thousands of files serially was
+    // the whole cost; jwalk already walks in parallel, so we stat there too.
+    let mut wd = jwalk::WalkDirGeneric::<((), Option<u64>)>::new(root)
         .skip_hidden(false)
         .follow_links(opts.follow_symlinks);
     if let Some(d) = opts.max_depth {
         wd = wd.max_depth(d);
     }
-    if !glob.is_empty() {
+    let glob = glob.clone();
+    let wd = wd.process_read_dir(move |_depth, _path, _state, children| {
         // Prune excluded entries *before* descending, so an excluded directory
         // (e.g. node_modules) costs no I/O for its entire subtree.
-        let glob = glob.clone();
-        wd = wd.process_read_dir(move |_depth, _path, _state, children| {
+        if !glob.is_empty() {
             children.retain(|res| match res {
                 Ok(e) => !is_excluded(&glob, &e.path()),
                 Err(_) => true,
             });
-        });
-    }
+        }
+        // Stat every file here (on the walk's rayon worker), caching its size.
+        for res in children.iter_mut() {
+            if let Ok(e) = res {
+                if e.file_type().is_file() {
+                    e.client_state = std::fs::metadata(e.path()).ok().map(|m| m.len());
+                }
+            }
+        }
+    });
 
     let mut files = Vec::new();
     let mut dirs = 0u64;
@@ -233,9 +246,8 @@ fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
                         dirs += 1; // don't count the root itself
                     }
                 } else if ft.is_file() {
-                    match e.metadata() {
-                        Ok(m) => {
-                            let size = m.len();
+                    match e.client_state {
+                        Some(size) => {
                             progress.files.fetch_add(1, Ordering::Relaxed);
                             progress.bytes.fetch_add(size, Ordering::Relaxed);
                             files.push(FileEntry {
@@ -243,7 +255,7 @@ fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
                                 size,
                             });
                         }
-                        Err(_) => skipped += 1,
+                        None => skipped += 1,
                     }
                 }
             }
@@ -587,12 +599,28 @@ pub fn remove_path(
                 .collect();
             errors.extend(file_errors);
 
-            // Remove directories deepest-first so each is empty when removed.
+            // Remove directories deepest-first. Within a single depth level no
+            // dir contains another, so each level is removed in parallel; the
+            // levels run deepest → shallowest so a dir is always empty when we
+            // reach it.
             dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
-            for d in &dirs {
-                if let Err(e) = std::fs::remove_dir(d) {
-                    errors.push(format!("{}: {e}", d.display()));
+            let mut i = 0;
+            while i < dirs.len() {
+                let depth = dirs[i].components().count();
+                let mut j = i;
+                while j < dirs.len() && dirs[j].components().count() == depth {
+                    j += 1;
                 }
+                let level_errors: Vec<String> = dirs[i..j]
+                    .par_iter()
+                    .filter_map(|d| {
+                        std::fs::remove_dir(d)
+                            .err()
+                            .map(|e| format!("{}: {e}", d.display()))
+                    })
+                    .collect();
+                errors.extend(level_errors);
+                i = j;
             }
         }
     }
@@ -644,6 +672,14 @@ fn hash_prefix(path: &Path, len: usize) -> std::io::Result<[u8; 32]> {
 }
 
 fn hash_file(path: &Path) -> std::io::Result<String> {
+    // Memory-map the file so BLAKE3 reads straight from the page cache with no
+    // buffered-read syscalls or intermediate copies — the fast path for the
+    // large files that dominate full-hash cost.
+    let mut hasher = blake3::Hasher::new();
+    if hasher.update_mmap(path).is_ok() {
+        return Ok(hasher.finalize().to_hex().to_string());
+    }
+    // Fallback: stream the file (mmap unsupported, empty, or a special file).
     let mut hasher = blake3::Hasher::new();
     let mut file = std::fs::File::open(path)?;
     std::io::copy(&mut file, &mut hasher)?;
