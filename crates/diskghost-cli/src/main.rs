@@ -167,11 +167,14 @@ fn main() -> ExitCode {
             }
             warn_invalid_globs(&walk.exclude);
             let opts = walk.to_options();
+            let started = std::time::Instant::now();
             let report = with_progress(|p| scan_with_progress(&path, top, &opts, p));
+            let elapsed = started.elapsed();
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             } else {
                 print_scan(&report);
+                println!("\nScanned in {}", fmt_duration(elapsed));
             }
         }
         Command::Dupes {
@@ -218,11 +221,16 @@ fn main() -> ExitCode {
             } else {
                 RemoveMode::Delete
             };
+            let started = std::time::Instant::now();
             let report = with_progress(|p| remove_path(&path, mode, !apply, p));
+            let elapsed = started.elapsed();
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             } else {
                 print_remove(&report, trash);
+                if !report.dry_run {
+                    println!("  done in {}", fmt_duration(elapsed));
+                }
             }
             if !report.errors.is_empty() {
                 return ExitCode::FAILURE;
@@ -255,6 +263,21 @@ fn print_remove(r: &RemoveReport, trash: bool) {
     }
 }
 
+/// Human-friendly elapsed time: sub-second in ms, seconds with one decimal,
+/// minutes+seconds when it runs long.
+fn fmt_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 1.0 {
+        format!("{} ms", d.as_millis())
+    } else if secs < 60.0 {
+        format!("{secs:.1} s")
+    } else {
+        let m = (secs / 60.0).floor() as u64;
+        let s = secs - (m as f64) * 60.0;
+        format!("{m}m {s:.0}s")
+    }
+}
+
 fn print_scan(r: &ScanReport) {
     println!("Scan of {}", r.root.display());
     println!(
@@ -263,6 +286,16 @@ fn print_scan(r: &ScanReport) {
         r.total_files,
         r.total_dirs
     );
+    if r.disk_total > 0 {
+        let used = r.disk_total.saturating_sub(r.disk_free);
+        let pct = (used as f64 / r.disk_total as f64) * 100.0;
+        println!(
+            "  disk: {} free of {} ({:.0}% used)",
+            human_size(r.disk_free),
+            human_size(r.disk_total),
+            pct
+        );
+    }
     if r.skipped > 0 {
         println!("  skipped: {} unreadable entries (permissions?)", r.skipped);
     }

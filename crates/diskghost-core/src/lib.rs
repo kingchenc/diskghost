@@ -91,6 +91,10 @@ pub struct ScanReport {
     pub root_files_count: u64,
     /// Largest individual files, largest first.
     pub top_files: Vec<FileEntry>,
+    /// Total bytes of the filesystem holding the scanned root (0 if unknown).
+    pub disk_total: u64,
+    /// Available bytes on that filesystem for non-privileged users (0 if unknown).
+    pub disk_free: u64,
 }
 
 /// A group of byte-identical files (hard links to the same physical file are
@@ -319,6 +323,8 @@ pub fn scan_with_progress(
     top_files.sort_by_key(|f| std::cmp::Reverse(f.size));
     top_files.truncate(top_n);
 
+    let (disk_total, disk_free) = disk_space(root);
+
     ScanReport {
         root: root.to_path_buf(),
         total_size,
@@ -329,7 +335,18 @@ pub fn scan_with_progress(
         root_files_size,
         root_files_count,
         top_files,
+        disk_total,
+        disk_free,
     }
+}
+
+/// Total and available bytes of the filesystem that holds `path`. Returns
+/// `(0, 0)` if the platform query fails (e.g. an unmounted or unreadable path),
+/// so callers can treat 0 as "unknown" without handling an error.
+pub fn disk_space(path: &Path) -> (u64, u64) {
+    let total = fs4::total_space(path).unwrap_or(0);
+    let free = fs4::available_space(path).unwrap_or(0);
+    (total, free)
 }
 
 /// Find duplicate files under `root` with default options. See [`find_duplicates_with_progress`].
