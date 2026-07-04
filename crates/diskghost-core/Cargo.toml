@@ -11,7 +11,7 @@ description = "Fast parallel disk scanning and duplicate detection — the engin
 [dependencies]
 jwalk = "0.8"
 rayon = "1"
-blake3 = "1"
+blake3 = { version = "1", features = ["mmap"] }
 same-file = "1"
 globset = "0.4"
 trash = "5"
