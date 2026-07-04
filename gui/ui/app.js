@@ -15,6 +15,7 @@ const I18N = {
     scan: "Scan size", dupes: "Find duplicates", cancel: "Cancel",
     placeholder: "Paste a folder path, drop a folder here, or use Browse…",
     total: "total", files: "files", folders: "folders", skipped: "skipped",
+    diskFree: "disk free", scanTime: "scan time",
     map: "Map (click a tile to drill in)", biggestFolders: "Biggest sub-folders",
     biggestFiles: "Biggest files", rootFiles: "file(s) directly in this folder",
     noDupes: "No duplicates found 🎉", groups: "groups", reclaimable: "reclaimable",
@@ -31,6 +32,7 @@ const I18N = {
     scan: "Größe scannen", dupes: "Duplikate finden", cancel: "Abbrechen",
     placeholder: "Ordnerpfad einfügen, Ordner hierher ziehen oder Durchsuchen…",
     total: "gesamt", files: "Dateien", folders: "Ordner", skipped: "übersprungen",
+    diskFree: "Platte frei", scanTime: "Scan-Zeit",
     map: "Karte (Kachel klicken zum Reinzoomen)", biggestFolders: "Größte Unterordner",
     biggestFiles: "Größte Dateien", rootFiles: "Datei(en) direkt in diesem Ordner",
     noDupes: "Keine Duplikate gefunden 🎉", groups: "Gruppen", reclaimable: "freigebbar",
@@ -75,6 +77,14 @@ function human(bytes) {
   let s = bytes, i = 0;
   while (s >= 1024 && i < u.length - 1) { s /= 1024; i++; }
   return i === 0 ? `${bytes} B` : `${s.toFixed(1)} ${u[i]}`;
+}
+
+function fmtMs(ms) {
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)} s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${Math.round(s - m * 60)}s`;
 }
 
 function baseName(p) {
@@ -134,7 +144,9 @@ async function doScan(pathOverride) {
   const top = parseInt($("top").value, 10) || 20;
   setBusy(true, t("working"));
   try {
+    const t0 = performance.now();
     const r = await invoke("scan_dir", { path, top, opts: readOpts() });
+    r._elapsedMs = performance.now() - t0;
     renderScan(r);
   } catch (e) {
     showError(e);
@@ -155,8 +167,10 @@ async function deletePath(path) {
   let msg = "";
   setBusy(true, t("deleting"));
   try {
+    const t0 = performance.now();
     const r = await invoke("remove_path_cmd", { path, trash, apply: true });
-    msg = `${t("del")}: ${r.files} ${t("files")}, ${human(r.bytes)} ${t("removedMsg")}`;
+    const took = fmtMs(performance.now() - t0);
+    msg = `${t("del")}: ${r.files} ${t("files")}, ${human(r.bytes)} ${t("removedMsg")} (${took})`;
     if (r.errors && r.errors.length) msg += ` — ${r.errors.length} ${t("errors")}`;
   } catch (e) {
     setBusy(false, "");
@@ -194,6 +208,8 @@ function renderScan(r) {
     stat(t("files"), r.total_files.toLocaleString()),
     stat(t("folders"), r.total_dirs.toLocaleString()));
   if (r.skipped > 0) stats.append(stat(t("skipped"), r.skipped.toLocaleString()));
+  if (r.disk_total > 0) stats.append(stat(t("diskFree"), `${human(r.disk_free)} / ${human(r.disk_total)}`));
+  if (r._elapsedMs != null) stats.append(stat(t("scanTime"), fmtMs(r._elapsedMs)));
   results.append(stats);
 
   // Treemap (squarified). If anything goes wrong, we just skip it — the bars below

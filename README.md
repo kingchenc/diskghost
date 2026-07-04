@@ -8,12 +8,17 @@ Find where your space went, hunt down byte-identical duplicates, and reclaim the
 ## Features
 
 - **Parallel scan** (`jwalk` + `rayon`) — total size, biggest sub-folders and
-  biggest files, files-directly-in-root, and a count of unreadable/skipped entries.
+  biggest files, files-directly-in-root, and a count of unreadable/skipped
+  entries. Also reports the drive's **free / total space** and how long the
+  scan took.
 - **Correct duplicate detection** — group by size → **collapse hard links**
   (same physical file, so `wasted` is real) → **first-block pre-hash** → full
   **BLAKE3** hash, all in parallel.
-- **Reclaim space** — delete, send to the **OS trash/recycle bin**, or replace a
-  copy with a **hard link**. Dry-run by default.
+- **Reclaim duplicates** — delete, send to the **OS trash/recycle bin**, or
+  replace a copy with a **hard link**. Dry-run by default.
+- **Delete a file or folder** — `diskghost rm <path>`, permanently or to the OS
+  trash. Parallel unlink for speed, never follows symlinks (can't escape the
+  target), refuses a drive root, dry-run by default, reports how long it took.
 - **Scan options** — exclude globs (`node_modules`, `*.tmp`), max depth,
   follow-symlinks.
 - **Live progress + cancel** — long scans report files/bytes and can be stopped.
@@ -25,9 +30,14 @@ Find where your space went, hunt down byte-identical duplicates, and reclaim the
 ## Install
 
 ```bash
-cargo install --path crates/diskghost-cli    # the `diskghost` command
-# or grab a prebuilt binary from the GitHub Releases page (Linux/macOS/Windows,
-# each with a SHA256 checksum + build-provenance attestation).
+# Install the `diskghost` command globally, straight from GitHub (no crates.io):
+cargo install --git https://github.com/kingchenc/diskghost diskghost-cli
+
+# ...or from a local checkout:
+cargo install --path crates/diskghost-cli
+
+# ...or grab a prebuilt binary from the GitHub Releases page (Linux/macOS/Windows,
+# each with a SHA256 checksum + build-provenance attestation) — no toolchain needed.
 ```
 
 ## CLI usage
@@ -104,6 +114,7 @@ Diskghost/
 - [x] Live progress + cancellation
 - [x] Modern GUI: treemap, folder picker, drag &amp; drop, one-click reclaim
 - [x] Delete files/folders (CLI `rm` + GUI) — permanent or to the OS trash, parallel unlink
+- [x] Drive free/total space + scan &amp; delete timings (CLI + GUI)
 - [x] CI (fmt/clippy/test/bench on 3 OS) + signed release binaries + GUI installers
 - [ ] Interactive treemap drill-up / breadcrumbs
 - [ ] Scheduled scans &amp; "what grew since last time"
