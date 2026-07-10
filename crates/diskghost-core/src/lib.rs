@@ -221,11 +221,9 @@ fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
             });
         }
         // Stat every file here (on the walk's rayon worker), caching its size.
-        for res in children.iter_mut() {
-            if let Ok(e) = res {
-                if e.file_type().is_file() {
-                    e.client_state = std::fs::metadata(e.path()).ok().map(|m| m.len());
-                }
+        for e in children.iter_mut().flatten() {
+            if e.file_type().is_file() {
+                e.client_state = std::fs::metadata(e.path()).ok().map(|m| m.len());
             }
         }
     });
