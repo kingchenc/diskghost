@@ -13,6 +13,7 @@ jobs:
   cli:
     name: cli • ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -24,9 +25,10 @@ jobs:
           # Windows
           - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
           - { os: windows-latest, target: aarch64-pc-windows-msvc, ext: ".exe" }
-          # macOS (arm64 native + Intel native on the x86 runner image)
+          # macOS: arm64 native on the Apple Silicon runner; Intel cross-compiled on the
+          # same runner (macos-13 is retired and hung to the 24h limit).
           - { os: macos-latest, target: aarch64-apple-darwin, ext: "" }
-          - { os: macos-13, target: x86_64-apple-darwin, ext: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, ext: "" }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -78,18 +80,26 @@ jobs:
             diskghost-${{ matrix.target }}${{ matrix.ext }}.sha256
 
   gui:
-    name: gui bundle • ${{ matrix.os }}
+    name: gui bundle • ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        # Native bundle per OS/arch: .AppImage/.deb/.rpm (Linux),
-        # .msi/.exe (Windows), .dmg for both Apple Silicon (macos-latest)
-        # and Intel (macos-13). Bundles are unsigned (no signing certs).
-        os: [ubuntu-latest, windows-latest, macos-latest, macos-13]
+        # Native bundle per OS/arch: .AppImage/.deb/.rpm (Linux), .msi/.exe (Windows),
+        # .dmg for Apple Silicon and Intel. macos-13 (Intel runner) is retired and used to
+        # hang to the 24h limit, so the Intel .dmg is cross-compiled on the Apple Silicon
+        # runner via --target x86_64-apple-darwin. Bundles are unsigned (no signing certs).
+        include:
+          - { os: ubuntu-latest,  name: linux,       target: "" }
+          - { os: windows-latest, name: windows,     target: "" }
+          - { os: macos-latest,   name: macos-arm64, target: aarch64-apple-darwin }
+          - { os: macos-latest,   name: macos-x64,   target: x86_64-apple-darwin }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - name: Install Tauri system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -109,13 +119,15 @@ jobs:
 
       - name: Build GUI bundles
         working-directory: gui/src-tauri
-        run: cargo tauri build
+        run: cargo tauri build ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
 
       - name: Collect bundles
         shell: bash
         run: |
           mkdir -p dist
-          find gui/src-tauri/target/release/bundle -type f \
+          # Match both host builds (target/release/bundle) and cross builds
+          # (target/<triple>/release/bundle) so the Intel .dmg is picked up too.
+          find gui/src-tauri/target -type f -path '*/release/bundle/*' \
             \( -name "*.dmg" -o -name "*.app.tar.gz" \
                -o -name "*.msi" -o -name "*-setup.exe" \
                -o -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \) \
