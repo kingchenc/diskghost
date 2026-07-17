@@ -64,7 +64,15 @@ impl Progress {
 #[derive(Debug, Clone, Serialize)]
 pub struct FileEntry {
     pub path: PathBuf,
+    /// Allocated size on disk — what the file actually occupies. This is what
+    /// disk-usage scanning reports, so OneDrive/dehydrated placeholders and
+    /// sparse files count their real footprint (often ~0), not their logical
+    /// length. See [`on_disk_size`].
     pub size: u64,
+    /// Logical (content) length from the file metadata. Used by duplicate
+    /// detection, where byte-identical files must group by content size
+    /// regardless of how they are allocated on disk.
+    pub logical_size: u64,
 }
 
 /// Aggregated size of a directory.
@@ -194,6 +202,80 @@ fn is_excluded(glob: &globset::GlobSet, path: &Path) -> bool {
     path.components().any(|c| glob.is_match(c.as_os_str()))
 }
 
+/// Bytes a file actually occupies on disk, as opposed to its logical length
+/// ([`std::fs::Metadata::len`]). The two differ for sparse files, filesystem
+/// compression, and — the case that matters most here — cloud placeholders
+/// (OneDrive "online-only" files) that advertise their full cloud size in the
+/// metadata but store ~0 bytes locally. A disk-usage tool must count the real
+/// footprint, or a folder full of placeholders is reported wildly too large.
+#[cfg(windows)]
+fn on_disk_size(meta: &std::fs::Metadata, path: &Path) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    // Only these attributes can make on-disk size diverge from the logical
+    // length. For the overwhelmingly common normal file we skip the extra
+    // syscall and use the length we already have, keeping the scan hot path
+    // exactly as cheap as before.
+    const SPARSE: u32 = 0x0000_0200;
+    const REPARSE_POINT: u32 = 0x0000_0400;
+    const COMPRESSED: u32 = 0x0000_0800;
+    const OFFLINE: u32 = 0x0000_1000;
+    const RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    const WEIRD: u32 =
+        SPARSE | REPARSE_POINT | COMPRESSED | OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS;
+
+    if meta.file_attributes() & WEIRD != 0 {
+        if let Some(actual) = compressed_size(path) {
+            return actual;
+        }
+    }
+    meta.file_size()
+}
+
+/// Actual allocated size via `GetCompressedFileSizeW`. Returns `None` on error
+/// so the caller can fall back to the logical length.
+#[cfg(windows)]
+fn compressed_size(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCompressedFileSizeW(lp_file_name: *const u16, lp_file_size_high: *mut u32) -> u32;
+        fn GetLastError() -> u32;
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut high: u32 = 0;
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 string kept alive for the
+    // call, and `high` is a valid out-pointer to a u32.
+    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+    if low == u32::MAX {
+        // INVALID_FILE_SIZE is only an error when GetLastError != NO_ERROR;
+        // otherwise it is a legitimate low dword equal to 0xFFFFFFFF.
+        // SAFETY: no preconditions.
+        if unsafe { GetLastError() } != 0 {
+            return None;
+        }
+    }
+    Some(((high as u64) << 32) | low as u64)
+}
+
+/// Bytes a file actually occupies on disk. On Unix `st_blocks` (512-byte units)
+/// reflects the real allocation, so sparse files and holes count correctly.
+#[cfg(unix)]
+fn on_disk_size(meta: &std::fs::Metadata, _path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.blocks().saturating_mul(512)
+}
+
+/// Fallback for platforms without an allocation query: use the logical length.
+#[cfg(not(any(windows, unix)))]
+fn on_disk_size(meta: &std::fs::Metadata, _path: &Path) -> u64 {
+    meta.len()
+}
+
 /// Walk `root` recursively in a single pass: collect files (with size), count
 /// directories, and count unreadable entries, honouring [`Options`].
 fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
@@ -204,7 +286,7 @@ fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
     // instead of one-at-a-time in the serial consumer below. This is the
     // scan's hot path: statting hundreds of thousands of files serially was
     // the whole cost; jwalk already walks in parallel, so we stat there too.
-    let mut wd = jwalk::WalkDirGeneric::<((), Option<u64>)>::new(root)
+    let mut wd = jwalk::WalkDirGeneric::<((), Option<(u64, u64)>)>::new(root)
         .skip_hidden(false)
         .follow_links(opts.follow_symlinks);
     if let Some(d) = opts.max_depth {
@@ -220,10 +302,14 @@ fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
                 Err(_) => true,
             });
         }
-        // Stat every file here (on the walk's rayon worker), caching its size.
+        // Stat every file here (on the walk's rayon worker), caching both its
+        // logical length and its real on-disk size as (logical, on_disk).
         for e in children.iter_mut().flatten() {
             if e.file_type().is_file() {
-                e.client_state = std::fs::metadata(e.path()).ok().map(|m| m.len());
+                let p = e.path();
+                e.client_state = std::fs::metadata(&p)
+                    .ok()
+                    .map(|m| (m.len(), on_disk_size(&m, &p)));
             }
         }
     });
@@ -245,12 +331,14 @@ fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
                     }
                 } else if ft.is_file() {
                     match e.client_state {
-                        Some(size) => {
+                        Some((logical, on_disk)) => {
                             progress.files.fetch_add(1, Ordering::Relaxed);
-                            progress.bytes.fetch_add(size, Ordering::Relaxed);
+                            // Progress and totals track real on-disk bytes.
+                            progress.bytes.fetch_add(on_disk, Ordering::Relaxed);
                             files.push(FileEntry {
                                 path: e.path(),
-                                size,
+                                size: on_disk,
+                                logical_size: logical,
                             });
                         }
                         None => skipped += 1,
@@ -376,15 +464,17 @@ pub fn find_duplicates_with_progress(
     opts: &Options,
     progress: &Progress,
 ) -> Vec<DupGroup> {
+    // Duplicate detection groups by *logical* (content) size — two byte-identical
+    // files are duplicates regardless of how they happen to be allocated on disk.
     let files: Vec<FileEntry> = walk(root, opts, progress)
         .files
         .into_iter()
-        .filter(|f| f.size >= min_size && f.size > 0)
+        .filter(|f| f.logical_size >= min_size && f.logical_size > 0)
         .collect();
 
     let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
     for f in files {
-        by_size.entry(f.size).or_default().push(f.path);
+        by_size.entry(f.logical_size).or_default().push(f.path);
     }
 
     let candidates: Vec<(u64, Vec<PathBuf>)> =
@@ -539,17 +629,18 @@ pub fn remove_path(
                 if e.file_type().is_dir() {
                     dirs.push(e.path());
                 } else {
+                    let p = e.path();
                     if let Ok(m) = e.metadata() {
-                        bytes = bytes.saturating_add(m.len());
+                        bytes = bytes.saturating_add(on_disk_size(&m, &p));
                     }
-                    files.push(e.path());
+                    files.push(p);
                 }
             }
         }
     } else {
         // A single file (or a symlink): remove just that entry.
         if let Ok(m) = &top {
-            bytes = m.len();
+            bytes = on_disk_size(m, path);
         }
         files.push(path.to_path_buf());
     }
@@ -728,13 +819,22 @@ mod tests {
         write(&d.join("a/2.bin"), &[0u8; 500]);
         write(&d.join("b/3.bin"), &[0u8; 200]);
         let r = scan(&d, 10);
-        assert_eq!(r.total_size, 1700);
+        // Totals are on-disk (allocated) bytes, which round up to the block size
+        // on filesystems like ext4, so assert a lower bound on the logical sum.
+        assert!(r.total_size >= 1700, "total_size {} < 1700", r.total_size);
         assert_eq!(r.total_files, 3);
         assert_eq!(
             r.children[0].path.file_name().unwrap().to_str().unwrap(),
             "a"
         );
-        assert_eq!(r.children[0].size, 1500);
+        assert!(
+            r.children[0].size >= 1500,
+            "children[0].size {} < 1500",
+            r.children[0].size
+        );
+        // Logical sizes remain exact regardless of allocation.
+        let logical: u64 = walk_files(&d).iter().map(|f| f.logical_size).sum();
+        assert_eq!(logical, 1700);
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -749,9 +849,13 @@ mod tests {
             .iter()
             .all(|c| c.path.file_name().unwrap() != "loose.bin"));
         assert_eq!(r.root_files_count, 1);
-        assert_eq!(r.root_files_size, 777);
+        assert!(
+            r.root_files_size >= 777,
+            "root_files_size {} < 777",
+            r.root_files_size
+        );
         assert_eq!(r.children.len(), 1);
-        assert_eq!(r.total_size, 1077);
+        assert!(r.total_size >= 1077, "total_size {} < 1077", r.total_size);
         std::fs::remove_dir_all(&d).ok();
     }
 
