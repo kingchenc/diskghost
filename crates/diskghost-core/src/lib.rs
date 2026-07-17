@@ -915,7 +915,12 @@ mod tests {
             ..Default::default()
         };
         let r = scan_with_progress(&d, 20, &opts, &Progress::default());
-        assert_eq!(r.total_size, 150, "junk.tmp should be excluded");
+        // junk.tmp is excluded, leaving keep.bin + deeper.bin. The file count is
+        // the exact exclusion check; total_size is on-disk (block-rounded on some
+        // filesystems) so it only gets a lower bound.
+        assert_eq!(r.total_files, 2, "junk.tmp should be excluded");
+        assert!(!r.top_files.iter().any(|f| f.path.ends_with("junk.tmp")));
+        assert!(r.total_size >= 150, "total_size {}", r.total_size);
 
         // Depth 1: only the root's direct children are visited.
         let shallow = Options {
@@ -967,7 +972,8 @@ mod tests {
         let r = scan_with_progress(&d, 10, &Options::default(), &p);
         assert_eq!(r.total_files, 2);
         assert_eq!(p.files(), 2);
-        assert_eq!(p.bytes(), 30);
+        // Progress bytes are on-disk (block-rounded on some filesystems).
+        assert!(p.bytes() >= 30, "progress bytes {}", p.bytes());
 
         // Pre-cancelled: the walk stops immediately and sees nothing.
         let c = Progress::default();
@@ -1043,7 +1049,8 @@ mod tests {
         let rep = remove_path(&d, RemoveMode::Delete, true, &Progress::default());
         assert!(rep.dry_run);
         assert_eq!(rep.files, 3);
-        assert_eq!(rep.bytes, 1700);
+        // Freed bytes are on-disk (block-rounded on some filesystems).
+        assert!(rep.bytes >= 1700, "freed bytes {}", rep.bytes);
         assert!(rep.dirs >= 2); // root + a + a/b (root counted by jwalk)
         assert!(rep.errors.is_empty());
         assert!(d.exists()); // nothing was touched
@@ -1070,7 +1077,8 @@ mod tests {
         write(&f, &[0u8; 321]);
         let rep = remove_path(&f, RemoveMode::Delete, false, &Progress::default());
         assert_eq!(rep.files, 1);
-        assert_eq!(rep.bytes, 321);
+        // Freed bytes are on-disk (block-rounded on some filesystems).
+        assert!(rep.bytes >= 321, "freed bytes {}", rep.bytes);
         assert!(!f.exists());
         assert!(d.exists()); // parent left intact
         std::fs::remove_dir_all(&d).ok();

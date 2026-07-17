@@ -4,7 +4,7 @@
 
 [package]
 name = "diskghost-gui"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 license = "MIT"
 description = "Diskghost desktop GUI (Tauri) — modern disk usage & duplicate finder."
