@@ -362,6 +362,7 @@ version = "0.6.2"
 dependencies = [
  "clap",
  "diskghost-core",
+ "serde",
  "serde_json",
 ]
 
@@ -377,6 +378,7 @@ dependencies = [
  "rayon",
  "same-file",
  "serde",
+ "serde_json",
  "trash",
 ]
 
