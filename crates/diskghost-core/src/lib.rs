@@ -8,8 +8,21 @@
 //!   * [`reclaim`] — act on duplicates: delete, send to trash, or replace with a
 //!     hard link (dry-run by default at the call site).
 //!
+//!   * [`ScanTree`] — the whole tree from one walk, so a UI can drill into any
+//!     sub-folder and back up without touching the disk again.
+//!   * [`Snapshot`] / [`diff`] — persist a scan and compare a later one against
+//!     it: what grew, what shrank, what is new, what is gone.
+//!
 //! [`Options`] controls the walk: exclude globs, max depth, follow-symlinks.
 //! Everything is `serde`-serialisable so a CLI, a GUI or an agent can consume it.
+
+mod snapshot;
+mod tree;
+
+pub use snapshot::{
+    diff, format_timestamp, DiffReport, DirDelta, Snapshot, SnapshotError, SNAPSHOT_FORMAT,
+};
+pub use tree::ScanTree;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Options controlling how the filesystem is walked (shared by scan + dupes).
 #[derive(Debug, Clone, Default)]
@@ -61,7 +74,7 @@ impl Progress {
 }
 
 /// A single file with its size in bytes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub path: PathBuf,
     /// Allocated size on disk — what the file actually occupies. This is what
@@ -76,7 +89,7 @@ pub struct FileEntry {
 }
 
 /// Aggregated size of a directory.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirSize {
     pub path: PathBuf,
     pub size: u64,
@@ -84,7 +97,7 @@ pub struct DirSize {
 }
 
 /// Summary of a scan.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanReport {
     pub root: PathBuf,
     pub total_size: u64,
@@ -103,6 +116,10 @@ pub struct ScanReport {
     pub disk_total: u64,
     /// Available bytes on that filesystem for non-privileged users (0 if unknown).
     pub disk_free: u64,
+    /// True if the walk was cancelled via [`Progress::cancel`] — every number
+    /// above then covers only the part of the tree seen before the stop.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 /// A group of byte-identical files (hard links to the same physical file are
@@ -162,10 +179,11 @@ pub struct RemoveReport {
 /// First N bytes hashed as a cheap pre-filter before a full-file hash.
 const PREFIX_LEN: usize = 4096;
 
-struct Walk {
-    files: Vec<FileEntry>,
-    dirs: u64,
-    skipped: u64,
+pub(crate) struct Walk {
+    pub(crate) files: Vec<FileEntry>,
+    /// Every directory below the root (the root itself is not listed).
+    pub(crate) dirs: Vec<PathBuf>,
+    pub(crate) skipped: u64,
 }
 
 fn build_globset(patterns: &[String]) -> globset::GlobSet {
@@ -241,6 +259,7 @@ fn compressed_size(path: &Path) -> Option<u64> {
     extern "system" {
         fn GetCompressedFileSizeW(lp_file_name: *const u16, lp_file_size_high: *mut u32) -> u32;
         fn GetLastError() -> u32;
+        fn SetLastError(dw_err_code: u32);
     }
     let wide: Vec<u16> = path
         .as_os_str()
@@ -248,6 +267,11 @@ fn compressed_size(path: &Path) -> Option<u64> {
         .chain(std::iter::once(0))
         .collect();
     let mut high: u32 = 0;
+    // Clear any stale error first: a legitimate low dword of 0xFFFFFFFF is only
+    // distinguishable from failure by GetLastError, which the API does not
+    // reset on success.
+    // SAFETY: no preconditions.
+    unsafe { SetLastError(0) };
     // SAFETY: `wide` is a valid NUL-terminated UTF-16 string kept alive for the
     // call, and `high` is a valid out-pointer to a u32.
     let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
@@ -276,9 +300,9 @@ fn on_disk_size(meta: &std::fs::Metadata, _path: &Path) -> u64 {
     meta.len()
 }
 
-/// Walk `root` recursively in a single pass: collect files (with size), count
+/// Walk `root` recursively in a single pass: collect files (with size), collect
 /// directories, and count unreadable entries, honouring [`Options`].
-fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
+pub(crate) fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
     let glob = Arc::new(build_globset(&opts.exclude));
 
     // Each file's size is cached in the entry's client_state (Some(size), or
@@ -315,7 +339,7 @@ fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
     });
 
     let mut files = Vec::new();
-    let mut dirs = 0u64;
+    let mut dirs = Vec::new();
     let mut skipped = 0u64;
 
     for entry in wd {
@@ -327,7 +351,7 @@ fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
                 let ft = e.file_type();
                 if ft.is_dir() {
                     if e.depth() > 0 {
-                        dirs += 1; // don't count the root itself
+                        dirs.push(e.path()); // the root itself is not listed
                     }
                 } else if ft.is_file() {
                     match e.client_state {
@@ -368,74 +392,15 @@ pub fn scan(root: &Path, top_n: usize) -> ScanReport {
 
 /// Scan `root`: total size, the `top_n` biggest immediate sub-folders, the bytes of
 /// files directly in the root, and the `top_n` biggest files. Reports live progress
-/// and can be cancelled via [`Progress`].
+/// and can be cancelled via [`Progress`]. Builds a [`ScanTree`] under the hood;
+/// keep the tree instead if you want to drill into sub-folders afterwards.
 pub fn scan_with_progress(
     root: &Path,
     top_n: usize,
     opts: &Options,
     progress: &Progress,
 ) -> ScanReport {
-    let Walk {
-        files,
-        dirs,
-        skipped,
-    } = walk(root, opts, progress);
-
-    let total_size: u64 = files.iter().map(|f| f.size).sum();
-    let total_files = files.len() as u64;
-
-    let mut by_child: HashMap<PathBuf, DirSize> = HashMap::new();
-    let mut root_files_size = 0u64;
-    let mut root_files_count = 0u64;
-
-    for f in &files {
-        if let Ok(rel) = f.path.strip_prefix(root) {
-            let mut comps = rel.components();
-            match (comps.next(), comps.next()) {
-                // Two or more components: `first` is a real sub-directory.
-                (Some(first), Some(_)) => {
-                    let key = root.join(first.as_os_str());
-                    let entry = by_child.entry(key.clone()).or_insert_with(|| DirSize {
-                        path: key,
-                        size: 0,
-                        file_count: 0,
-                    });
-                    entry.size += f.size;
-                    entry.file_count += 1;
-                }
-                // Exactly one component: the file sits directly in the root.
-                (Some(_), None) => {
-                    root_files_size += f.size;
-                    root_files_count += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut children: Vec<DirSize> = by_child.into_values().collect();
-    children.sort_by_key(|d| std::cmp::Reverse(d.size));
-    children.truncate(top_n);
-
-    let mut top_files = files;
-    top_files.sort_by_key(|f| std::cmp::Reverse(f.size));
-    top_files.truncate(top_n);
-
-    let (disk_total, disk_free) = disk_space(root);
-
-    ScanReport {
-        root: root.to_path_buf(),
-        total_size,
-        total_files,
-        total_dirs: dirs,
-        skipped,
-        children,
-        root_files_size,
-        root_files_count,
-        top_files,
-        disk_total,
-        disk_free,
-    }
+    ScanTree::build(root, opts, progress).root_report(top_n)
 }
 
 /// Total and available bytes of the filesystem that holds `path`. Returns
@@ -791,6 +756,15 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Format a signed byte difference, e.g. `+1.5 GB`, `-300.0 MB`, or `0 B`.
+pub fn human_delta(delta: i64) -> String {
+    match delta {
+        0 => "0 B".to_string(),
+        d if d > 0 => format!("+{}", human_size(d.unsigned_abs())),
+        d => format!("-{}", human_size(d.unsigned_abs())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,6 +1012,45 @@ mod tests {
         assert_eq!(human_size(1023), "1023 B");
         assert_eq!(human_size(1024), "1.0 KB");
         assert_eq!(human_size(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn human_delta_carries_the_sign() {
+        assert_eq!(human_delta(0), "0 B");
+        assert_eq!(human_delta(1536), "+1.5 KB");
+        assert_eq!(human_delta(-1536), "-1.5 KB");
+        assert_eq!(human_delta(-1), "-1 B");
+    }
+
+    #[test]
+    fn cancelled_scan_is_flagged_in_the_report() {
+        let d = tmpdir("scancancel");
+        write(&d.join("a/1.bin"), &[0u8; 10]);
+        let ok = scan(&d, 10);
+        assert!(!ok.cancelled);
+        let c = Progress::default();
+        c.cancel();
+        let r = scan_with_progress(&d, 10, &Options::default(), &c);
+        assert!(r.cancelled);
+        assert_eq!(r.total_files, 0);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn cancelled_duplicate_search_stops_early() {
+        let d = tmpdir("dupecancel");
+        let body = b"duplicate content that is long enough to matter here";
+        write(&d.join("x/1.bin"), body);
+        write(&d.join("y/2.bin"), body);
+        assert_eq!(find_duplicates(&d, 1).len(), 1);
+
+        // Pre-cancelled: the walk sees nothing, so no groups can form.
+        let c = Progress::default();
+        c.cancel();
+        let groups = find_duplicates_with_progress(&d, 1, &Options::default(), &c);
+        assert!(groups.is_empty());
+        assert_eq!(c.files(), 0);
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

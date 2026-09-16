@@ -1,21 +1,34 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use diskghost_core::{
-    find_duplicates_with_progress, reclaim, remove_path, scan_with_progress, DupGroup, Options,
-    Progress, ReclaimAction, ReclaimReport, RemoveMode, RemoveReport, ScanReport,
+    diff, find_duplicates_with_progress, reclaim, remove_path, DiffReport, DupGroup, Options,
+    Progress, ReclaimAction, ReclaimReport, RemoveMode, RemoveReport, ScanReport, ScanTree,
+    Snapshot,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 
-/// Holds the `Progress` of the operation currently running, so `cancel` can flag it.
+/// How many snapshots to keep per scanned root.
+const SNAPSHOTS_PER_ROOT: usize = 20;
+
+/// The tree of the last complete walk, plus the options it was walked with.
+/// Drilling into any folder below its root is served from here, no I/O.
+struct Cached {
+    tree: ScanTree,
+    opts: WalkOpts,
+}
+
+/// Holds the `Progress` of the operation currently running (so `cancel` can
+/// flag it) and the cached scan tree.
 struct AppState {
     current: Mutex<Progress>,
+    cache: Mutex<Option<Cached>>,
 }
 
 /// Payload pushed to the frontend as a scan/search runs.
@@ -26,7 +39,7 @@ struct ProgressPayload {
 }
 
 /// Walk options coming from the frontend.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone, PartialEq, Eq)]
 #[serde(default)]
 struct WalkOpts {
     exclude: Vec<String>,
@@ -35,11 +48,11 @@ struct WalkOpts {
 }
 
 impl WalkOpts {
-    fn into_options(self) -> Options {
+    fn to_options(&self) -> Options {
         Options {
             max_depth: self.max_depth,
             follow_symlinks: self.follow_symlinks,
-            exclude: self.exclude,
+            exclude: self.exclude.clone(),
         }
     }
 }
@@ -76,7 +89,48 @@ fn register(state: &tauri::State<'_, AppState>, progress: &Progress) {
     }
 }
 
-/// Scan a directory (blocking work off-thread; progress emitted live).
+/// Where snapshots of `root` live: one folder per scanned directory under the
+/// app's data dir, files named by their Unix timestamp.
+fn snapshot_dir(app: &tauri::AppHandle, root: &Path) -> Result<PathBuf, String> {
+    let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(base.join("snapshots").join(Snapshot::root_key(root)))
+}
+
+/// Timestamps of the snapshots in `dir`, newest first.
+fn snapshot_times(dir: &Path) -> Vec<u64> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut times: Vec<u64> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let stem = name.to_str()?.strip_suffix(".json")?;
+            stem.parse().ok()
+        })
+        .collect();
+    times.sort_unstable_by(|a, b| b.cmp(a));
+    times
+}
+
+fn snapshot_file(dir: &Path, taken_at: u64) -> PathBuf {
+    dir.join(format!("{taken_at}.json"))
+}
+
+/// Save `snap` into `dir` and drop the oldest ones beyond the retention limit.
+fn store_snapshot(dir: &Path, snap: &Snapshot) -> Result<(), String> {
+    snap.save(&snapshot_file(dir, snap.taken_at))
+        .map_err(|e| e.to_string())?;
+    for old in snapshot_times(dir).into_iter().skip(SNAPSHOTS_PER_ROOT) {
+        let _ = std::fs::remove_file(snapshot_file(dir, old));
+    }
+    Ok(())
+}
+
+/// Scan a directory. Served from the cached tree when the path lies below the
+/// last complete walk (same options) — otherwise the tree is walked afresh off
+/// the async thread with live progress, cached, and recorded as a snapshot.
+/// `refresh` forces a fresh walk.
 #[tauri::command]
 async fn scan_dir(
     app: tauri::AppHandle,
@@ -84,21 +138,43 @@ async fn scan_dir(
     path: String,
     top: usize,
     opts: WalkOpts,
+    refresh: bool,
 ) -> Result<ScanReport, String> {
+    let requested = PathBuf::from(&path);
+    if !refresh {
+        if let Ok(cache) = state.cache.lock() {
+            if let Some(c) = cache.as_ref() {
+                if c.opts == opts {
+                    if let Some(report) = c.tree.report(&requested, top) {
+                        return Ok(report);
+                    }
+                }
+            }
+        }
+    }
+
     let progress = Progress::default();
     register(&state, &progress);
-    let opts = opts.into_options();
     let done = Arc::new(AtomicBool::new(false));
     let _done = DoneGuard(done.clone());
     spawn_emitter(app.clone(), progress.clone(), done);
 
     let job = progress.clone();
+    let handle = app.clone();
     let res = tauri::async_runtime::spawn_blocking(move || {
-        let p = PathBuf::from(&path);
-        if !p.is_dir() {
+        if !requested.is_dir() {
             return Err(format!("not a directory: {path}"));
         }
-        Ok(scan_with_progress(&p, top, &opts, &job))
+        let tree = ScanTree::build(&requested, &opts.to_options(), &job);
+        let report = tree.root_report(top);
+        // A cancelled walk is a partial view: show it, but never cache it or
+        // let it pose as a point in the folder's history.
+        if !tree.cancelled() {
+            let dir = snapshot_dir(&handle, tree.root())?;
+            store_snapshot(&dir, &Snapshot::capture(&tree, top))?;
+            with_cache(&handle, |cache| *cache = Some(Cached { tree, opts }));
+        }
+        Ok(report)
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -113,6 +189,77 @@ async fn scan_dir(
     res
 }
 
+/// Run `f` on the cached-tree slot. A poisoned lock means nothing happens.
+fn with_cache<R>(app: &tauri::AppHandle, f: impl FnOnce(&mut Option<Cached>) -> R) -> Option<R> {
+    let state = app.state::<AppState>();
+    let mut guard = state.cache.lock().ok()?;
+    Some(f(&mut guard))
+}
+
+/// Forget the cached tree, so the next scan walks the disk again.
+fn invalidate(app: &tauri::AppHandle) {
+    with_cache(app, |cache| *cache = None);
+}
+
+/// Snapshot history of the scanned root that `path` belongs to.
+#[derive(Serialize)]
+struct SnapshotList {
+    /// The scanned root the history is about.
+    root: String,
+    /// Unix timestamps of the stored snapshots, newest first.
+    taken_at: Vec<u64>,
+}
+
+/// List the snapshots recorded for the root the cached tree was built from
+/// (or, without a cached tree, for `path` itself as a root).
+#[tauri::command]
+fn list_snapshots(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<SnapshotList, String> {
+    let requested = PathBuf::from(&path);
+    let root = match state.cache.lock() {
+        Ok(cache) => match cache.as_ref() {
+            Some(c) if c.tree.contains(&requested) => c.tree.root().to_path_buf(),
+            _ => requested,
+        },
+        Err(_) => requested,
+    };
+    let dir = snapshot_dir(&app, &root)?;
+    Ok(SnapshotList {
+        root: root.to_string_lossy().into_owned(),
+        taken_at: snapshot_times(&dir),
+    })
+}
+
+/// What changed under `path` (which must lie in the cached tree) since the
+/// snapshot taken at `taken_at`: the current tree is compared against it.
+#[tauri::command]
+async fn diff_since(
+    app: tauri::AppHandle,
+    path: String,
+    taken_at: u64,
+    top: usize,
+) -> Result<DiffReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let at = PathBuf::from(&path);
+        let state = app.state::<AppState>();
+        let cache = state.cache.lock().map_err(|e| e.to_string())?;
+        let Some(c) = cache.as_ref().filter(|c| c.tree.contains(&at)) else {
+            return Err(format!("scan {path} first"));
+        };
+        let dir = snapshot_dir(&app, c.tree.root())?;
+        let old = Snapshot::load(&snapshot_file(&dir, taken_at)).map_err(|e| e.to_string())?;
+        let now = Snapshot::capture(&c.tree, top);
+        let mut report = diff(&old, &now, &at).map_err(|e| e.to_string())?;
+        report.truncate(top);
+        Ok(report)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Find duplicate files (blocking work off-thread; progress emitted live).
 #[tauri::command]
 async fn find_dupes(
@@ -124,7 +271,7 @@ async fn find_dupes(
 ) -> Result<Vec<DupGroup>, String> {
     let progress = Progress::default();
     register(&state, &progress);
-    let opts = opts.into_options();
+    let opts = opts.to_options();
     let done = Arc::new(AtomicBool::new(false));
     let _done = DoneGuard(done.clone());
     spawn_emitter(app.clone(), progress.clone(), done);
@@ -165,8 +312,10 @@ struct ReclaimJob {
 }
 
 /// Reclaim space across many duplicate groups. `action` is delete/trash/hardlink.
+/// A real reclaim changes files the cached tree may hold, so the cache is dropped.
 #[tauri::command]
 async fn reclaim_dupes(
+    app: tauri::AppHandle,
     jobs: Vec<ReclaimJob>,
     action: String,
     dry_run: bool,
@@ -189,6 +338,9 @@ async fn reclaim_dupes(
             reclaimed += r.reclaimed;
             errors.extend(r.errors);
         }
+        if !dry_run && removed > 0 {
+            invalidate(&app);
+        }
         Ok(ReclaimReport {
             removed,
             reclaimed,
@@ -202,7 +354,9 @@ async fn reclaim_dupes(
 
 /// Remove a file or folder — permanently or to the OS trash. `apply=false` is a
 /// dry run that only reports what would go. Progress is emitted live and the
-/// operation is cancellable. Refuses a filesystem root as a safety net.
+/// operation is cancellable. Refuses a filesystem root as a safety net. After a
+/// clean removal the cached tree is updated in place (no re-walk); if anything
+/// failed the cache is dropped so the next scan reflects the disk.
 #[tauri::command]
 async fn remove_path_cmd(
     app: tauri::AppHandle,
@@ -231,7 +385,20 @@ async fn remove_path_cmd(
         } else {
             RemoveMode::Delete
         };
-        Ok(remove_path(&p, mode, !apply, &job))
+        let report = remove_path(&p, mode, !apply, &job);
+        if apply {
+            if report.errors.is_empty() {
+                with_cache(&app, |cache| {
+                    if let Some(c) = cache.as_mut() {
+                        c.tree.remove(&p);
+                        c.tree.refresh_disk_space();
+                    }
+                });
+            } else {
+                invalidate(&app);
+            }
+        }
+        Ok(report)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -258,6 +425,7 @@ fn main() {
         .setup(|app| {
             app.manage(AppState {
                 current: Mutex::new(Progress::default()),
+                cache: Mutex::new(None),
             });
             Ok(())
         })
@@ -267,7 +435,9 @@ fn main() {
             cancel,
             reclaim_dupes,
             remove_path_cmd,
-            pick_folder
+            pick_folder,
+            list_snapshots,
+            diff_since
         ])
         .run(tauri::generate_context!())
         .expect("error while running Diskghost");

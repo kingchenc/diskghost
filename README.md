@@ -21,7 +21,15 @@ Find where your space went, hunt down byte-identical duplicates, and reclaim the
   target), refuses a drive root, dry-run by default, reports how long it took.
 - **Scan options** — exclude globs (`node_modules`, `*.tmp`), max depth,
   follow-symlinks.
-- **Live progress + cancel** — long scans report files/bytes and can be stopped.
+- **Live progress + cancel** — long scans report files/bytes and can be stopped;
+  a cancelled scan is clearly labelled as a partial result.
+- **One walk, whole tree** — the scan builds an in-memory tree, so the GUI
+  drills into any sub-folder and back up instantly, without touching the disk
+  again. Deleting from the GUI updates the tree in place.
+- **What grew since last time** — save a scan as a snapshot and compare a
+  later one against it: which folders grew or shrank, which are new, which are
+  gone. Every directory is recorded (not just the biggest), so the comparison
+  works at any depth. The GUI keeps a history per scanned folder automatically.
 - **Three faces, one Rust core**:
   - a **CLI** with `--json` output for scripts and agents (headless);
   - a **modern desktop GUI** (Tauri) with a treemap, folder picker, drag &amp; drop
@@ -62,15 +70,28 @@ diskghost rm "D:\old_project\target"            # shows how many files/dirs/byte
 diskghost rm "D:\old_project\target" --apply    # permanently delete (files unlinked in parallel)
 diskghost rm "D:\old_project\target" --trash --apply   # send to the OS recycle bin instead
 #   never follows symlinks (can't escape the target); refuses a drive root
+
+# What grew since last time: save a snapshot, compare against it later
+diskghost scan "C:\Users\me" --save before.json
+diskghost scan "C:\Users\me" --since before.json          # scan + what grew/shrank/appeared/vanished
+diskghost scan "C:\Users\me" --since before.json --save after.json
+diskghost diff before.json after.json                      # compare two saved snapshots
+diskghost diff before.json after.json --at "C:\Users\me\Downloads"   # ...at a sub-folder
 ```
+
+Snapshots are plain JSON, so a scheduled task (cron, Task Scheduler) that runs
+`diskghost scan <dir> --since last.json --save last.json --json` gives you a
+daily "what grew" report with nothing else to set up.
 
 ### Headless / agent mode
 
 Add `--json` to any command for machine-readable output:
 
 ```bash
-diskghost scan . --json          # total_size, children, top_files, root_files, skipped …
+diskghost scan . --json          # total_size, children, top_files, root_files, skipped, cancelled …
 diskghost dupes . --min-mb 10 --json   # duplicate groups with reclaimable bytes
+diskghost scan . --since old.json --json   # the report plus a "diff" object (grown/shrunk/added/removed)
+diskghost diff old.json new.json --json    # just the diff
 ```
 
 Perfect for wiring into an automation/agent that decides what to clean.
@@ -78,9 +99,13 @@ Perfect for wiring into an automation/agent that decides what to clean.
 ## Desktop app (GUI)
 
 A modern Tauri UI lives in `gui/` — **Browse** or drag a folder onto the window,
-hit **Scan size** for a treemap + biggest folders/files (click a folder to drill
-in), or **Find duplicates** to sort/filter groups and reclaim their space with one
-click. Scans show live progress and can be cancelled. From `gui/src-tauri`:
+hit **Scan size** for a treemap + biggest folders/files (click a tile or a
+breadcrumb to drill in and back up — served from the in-memory tree, so it is
+instant; **Rescan** walks the disk again), or **Find duplicates** to sort/filter
+groups and reclaim their space with one click. Scans show live progress and can
+be cancelled. Every complete scan is kept as a snapshot; pick an earlier one
+under **Since** and **Show changes** colours the treemap and folder bars by what
+grew or shrank and lists new and removed folders. From `gui/src-tauri`:
 
 ```bash
 cargo tauri dev      # run the app
@@ -90,7 +115,8 @@ cargo tauri build    # bundle an installer
 ## Why it's fast — and correct
 
 - Parallel directory walk across all cores; a **single pass** counts files *and*
-  directories.
+  directories, and builds the whole tree in memory so navigating it costs no
+  further I/O.
 - Duplicate detection never hashes more than it must: size buckets first, hard
   links collapsed, a cheap first-block pre-hash, then BLAKE3 — streamed, so large
   files never load into RAM.
@@ -102,9 +128,9 @@ cargo tauri build    # bundle an installer
 ```
 Diskghost/
 ├── crates/
-│   ├── diskghost-core/   the engine: scan + duplicate detection + reclaim (a library)
+│   ├── diskghost-core/   the engine: scan tree, duplicates, reclaim, snapshots + diff (a library)
 │   └── diskghost-cli/    the `diskghost` command
-└── gui/                  Tauri desktop app (modern dark UI)
+└── gui/                  Tauri desktop app (modern dark UI; ui/lib.js has Node unit tests)
 ```
 
 ## Roadmap
@@ -115,9 +141,10 @@ Diskghost/
 - [x] Modern GUI: treemap, folder picker, drag &amp; drop, one-click reclaim
 - [x] Delete files/folders (CLI `rm` + GUI) — permanent or to the OS trash, parallel unlink
 - [x] Drive free/total space + scan &amp; delete timings (CLI + GUI)
-- [x] CI (fmt/clippy/test/bench on 3 OS) + signed release binaries + GUI installers
-- [ ] Interactive treemap drill-up / breadcrumbs
-- [ ] Scheduled scans &amp; "what grew since last time"
+- [x] CI (fmt/clippy/test/bench on 3 OS) + checksummed, provenance-attested release binaries + GUI installers
+- [x] Interactive treemap drill-up / breadcrumbs, served from an in-memory tree
+- [x] Snapshots &amp; "what grew since last time" (CLI `--save`/`--since`/`diff`, GUI history)
+- [ ] Code-signed GUI installers
 
 ## Development
 
@@ -125,6 +152,7 @@ Diskghost/
 cargo test --workspace                                   # unit + integration tests
 cargo clippy --workspace --all-targets -- -D warnings    # lints (CI gate)
 cargo bench -p diskghost-core                             # criterion benchmarks
+node --test gui/ui/lib.test.js                            # GUI helper unit tests
 ```
 
 ## License

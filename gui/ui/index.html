@@ -28,6 +28,7 @@
       </div>
       <div class="actions">
         <button id="btn-scan" class="primary" type="button" data-i18n="scan">Scan size</button>
+        <button id="btn-rescan" type="button" data-i18n="rescan" title="Walk the disk again instead of using the cached tree">Rescan</button>
         <button id="btn-dupes" type="button" data-i18n="dupes">Find duplicates</button>
         <button id="btn-cancel" class="danger" type="button" style="display: none" data-i18n="cancel">Cancel</button>
       </div>
@@ -37,6 +38,7 @@
     <div id="status" class="status" role="status" aria-live="polite"></div>
     <main id="results" tabindex="-1"></main>
 
+    <script src="lib.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

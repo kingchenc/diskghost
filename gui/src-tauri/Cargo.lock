@@ -673,6 +673,7 @@ dependencies = [
  "rayon",
  "same-file",
  "serde",
+ "serde_json",
  "trash",
 ]
 

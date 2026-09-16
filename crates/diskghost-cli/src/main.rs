@@ -11,10 +11,11 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use diskghost_core::{
-    find_duplicates_with_progress, human_size, reclaim, remove_path, scan_with_progress,
-    validate_globs, DupGroup, Options, Progress, ReclaimAction, RemoveMode, RemoveReport,
-    ScanReport,
+    diff, find_duplicates_with_progress, format_timestamp, human_delta, human_size, reclaim,
+    remove_path, validate_globs, DiffReport, DupGroup, Options, Progress, ReclaimAction,
+    RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot,
 };
+use serde::Serialize;
 
 /// Run `job` with a `Progress`, printing a live line to stderr while it works
 /// (only when stderr is a terminal, so JSON/pipe output stays clean).
@@ -80,6 +81,26 @@ enum Command {
         top: usize,
         #[command(flatten)]
         walk: WalkArgs,
+        /// Save the scan as a snapshot (JSON) for a later `--since` or `diff`.
+        #[arg(long, value_name = "FILE")]
+        save: Option<PathBuf>,
+        /// Compare against a snapshot saved earlier: what grew, shrank,
+        /// appeared or vanished since then.
+        #[arg(long, value_name = "FILE")]
+        since: Option<PathBuf>,
+    },
+    /// Compare two snapshots saved with `scan --save`.
+    Diff {
+        /// The older snapshot.
+        old: PathBuf,
+        /// The newer snapshot.
+        new: PathBuf,
+        /// Compare at this sub-folder instead of the scanned root.
+        #[arg(long, value_name = "DIR")]
+        at: Option<PathBuf>,
+        /// How many entries to show per list.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
     },
     /// Find duplicate (byte-identical) files; optionally reclaim their space.
     Dupes {
@@ -160,21 +181,90 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Scan { path, top, walk } => {
+        Command::Scan {
+            path,
+            top,
+            walk,
+            save,
+            since,
+        } => {
             if !path.is_dir() {
                 eprintln!("error: not a directory: {}", path.display());
                 return ExitCode::FAILURE;
             }
             warn_invalid_globs(&walk.exclude);
             let opts = walk.to_options();
+            // Load the old snapshot before scanning, so a bad file fails fast.
+            let old = match since.as_deref().map(Snapshot::load) {
+                Some(Ok(s)) => Some(s),
+                Some(Err(e)) => {
+                    eprintln!("error: cannot read snapshot: {e}");
+                    return ExitCode::FAILURE;
+                }
+                None => None,
+            };
             let started = std::time::Instant::now();
-            let report = with_progress(|p| scan_with_progress(&path, top, &opts, p));
+            let tree = with_progress(|p| ScanTree::build(&path, &opts, p));
             let elapsed = started.elapsed();
+            let report = tree.root_report(top);
+            let snapshot = (old.is_some() || save.is_some()).then(|| Snapshot::capture(&tree, top));
+            let changes = match (&old, &snapshot) {
+                (Some(old), Some(new)) => match diff(old, new, &report.root) {
+                    Ok(mut d) => {
+                        d.truncate(top);
+                        Some(d)
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                _ => None,
+            };
+            if cli.json {
+                let out = ScanOutput {
+                    report: &report,
+                    diff: changes.as_ref(),
+                };
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                print_scan(&report);
+                if let Some(d) = &changes {
+                    println!();
+                    print_diff(d);
+                }
+                println!("\nScanned in {}", fmt_duration(elapsed));
+            }
+            if let (Some(file), Some(snap)) = (&save, &snapshot) {
+                if let Err(e) = snap.save(file) {
+                    eprintln!("error: cannot save snapshot: {e}");
+                    return ExitCode::FAILURE;
+                }
+                // Keep stdout clean for --json consumers.
+                eprintln!("snapshot saved to {}", file.display());
+            }
+        }
+        Command::Diff { old, new, at, top } => {
+            let (old, new) = match (Snapshot::load(&old), Snapshot::load(&new)) {
+                (Ok(o), Ok(n)) => (o, n),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("error: cannot read snapshot: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let at = at.unwrap_or_else(|| new.root.clone());
+            let mut report = match diff(&old, &new, &at) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            report.truncate(top);
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             } else {
-                print_scan(&report);
-                println!("\nScanned in {}", fmt_duration(elapsed));
+                print_diff(&report);
             }
         }
         Command::Dupes {
@@ -241,6 +331,72 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `scan --json` output: the report's fields at the top level, plus `diff`
+/// when `--since` was given.
+#[derive(Serialize)]
+struct ScanOutput<'a> {
+    #[serde(flatten)]
+    report: &'a ScanReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff: Option<&'a DiffReport>,
+}
+
+fn print_diff(d: &DiffReport) {
+    println!(
+        "Changes in {} since {} (now {})",
+        d.root.display(),
+        format_timestamp(d.old_taken_at),
+        format_timestamp(d.new_taken_at)
+    );
+    println!(
+        "  total: {} ({} -> {}), {:+} file(s)",
+        human_delta(d.delta),
+        human_size(d.old_size),
+        human_size(d.new_size),
+        d.files_delta
+    );
+    if d.is_unchanged() {
+        println!("  nothing changed");
+        return;
+    }
+    if !d.grown.is_empty() {
+        println!("\nGrew:");
+        for g in &d.grown {
+            println!(
+                "  {:>10}  {}  ({} -> {})",
+                human_delta(g.delta),
+                g.path.display(),
+                human_size(g.old_size),
+                human_size(g.new_size)
+            );
+        }
+    }
+    if !d.shrunk.is_empty() {
+        println!("\nShrank:");
+        for s in &d.shrunk {
+            println!(
+                "  {:>10}  {}  ({} -> {})",
+                human_delta(s.delta),
+                s.path.display(),
+                human_size(s.old_size),
+                human_size(s.new_size)
+            );
+        }
+    }
+    if !d.added.is_empty() {
+        println!("\nNew folders:");
+        for a in &d.added {
+            println!("  {:>10}  {}", human_size(a.size), a.path.display());
+        }
+    }
+    if !d.removed.is_empty() {
+        println!("\nRemoved folders:");
+        for r in &d.removed {
+            println!("  {:>10}  {}", human_size(r.size), r.path.display());
+        }
+    }
+}
+
 fn print_remove(r: &RemoveReport, trash: bool) {
     let dest = if trash { "trash" } else { "delete" };
     let what = format!(
@@ -298,6 +454,9 @@ fn print_scan(r: &ScanReport) {
     }
     if r.skipped > 0 {
         println!("  skipped: {} unreadable entries (permissions?)", r.skipped);
+    }
+    if r.cancelled {
+        println!("  CANCELLED: partial result, the numbers cover only what was scanned");
     }
     println!();
 
