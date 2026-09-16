@@ -141,10 +141,9 @@ Diskghost/
 - [x] Modern GUI: treemap, folder picker, drag &amp; drop, one-click reclaim
 - [x] Delete files/folders (CLI `rm` + GUI) — permanent or to the OS trash, parallel unlink
 - [x] Drive free/total space + scan &amp; delete timings (CLI + GUI)
-- [x] CI (fmt/clippy/test/bench on 3 OS) + checksummed, provenance-attested release binaries + GUI installers
+- [x] CI (fmt/clippy/test/bench on 3 OS) + release binaries with checksums + GUI installers
 - [x] Interactive treemap drill-up / breadcrumbs, served from an in-memory tree
 - [x] Snapshots &amp; "what grew since last time" (CLI `--save`/`--since`/`diff`, GUI history)
-- [ ] Code-signed GUI installers
 
 ## Development
 
