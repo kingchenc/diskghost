@@ -65,6 +65,10 @@ jobs:
         run: |
           cargo clippy --all-targets -- -D warnings
           cargo build --release
+      # The UI's pure helpers (formatting, breadcrumbs, treemap layout, diff
+      # indexing) are plain JS with Node unit tests; no npm install needed.
+      - name: UI unit tests
+        run: node --test gui/ui/lib.test.js
 
   deny:
     name: cargo-deny (supply chain)
