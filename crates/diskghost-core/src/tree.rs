@@ -329,11 +329,13 @@ mod tests {
 
     #[test]
     fn drill_in_matches_a_fresh_scan() {
+        // Sizes are spread well beyond one filesystem block: on-disk sizes
+        // round up to the block (4 KB on ext4), so small files would tie.
         let d = tmpdir("drill");
-        write(&d.join("a/1.bin"), &[0u8; 1000]);
-        write(&d.join("a/x/2.bin"), &[0u8; 500]);
-        write(&d.join("a/x/y/3.bin"), &[0u8; 250]);
-        write(&d.join("b/4.bin"), &[0u8; 200]);
+        write(&d.join("a/1.bin"), &[0u8; 100_000]);
+        write(&d.join("a/x/2.bin"), &[0u8; 40_000]);
+        write(&d.join("a/x/y/3.bin"), &[0u8; 20_000]);
+        write(&d.join("b/4.bin"), &[0u8; 10_000]);
         write(&d.join("top.bin"), &[0u8; 100]);
         std::fs::create_dir_all(d.join("empty")).unwrap();
 
