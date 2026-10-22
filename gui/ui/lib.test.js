@@ -264,3 +264,15 @@ test("folderSets groups duplicates by the folders their copies are in", () => {
   assert.equal(sets[1].wasted, 150);
   assert.deepEqual(lib.folderSets([]), []);
 });
+
+test("protectedExcludes covers the protected folders and program file types", () => {
+  const ex = lib.protectedExcludes();
+  assert.ok(ex.includes("steamapps"));
+  assert.ok(ex.includes("program files"));
+  assert.ok(ex.includes("*.dll"));
+  assert.ok(ex.includes("*.pak"));
+  assert.ok(ex.includes("*.pck"));
+  assert.ok(!ex.includes("*.jpg"));
+  assert.equal(new Set(ex).size, ex.length);
+  assert.equal(lib.mergeSettings({ engine: "mft" }).engine, "mft");
+});

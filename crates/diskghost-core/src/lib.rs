@@ -16,9 +16,14 @@
 //! [`Options`] controls the walk: exclude globs, max depth, follow-symlinks.
 //! Everything is `serde`-serialisable so a CLI, a GUI or an agent can consume it.
 
+mod dupes;
+#[cfg(windows)]
+mod mft;
 mod snapshot;
 mod tree;
 mod walk;
+
+pub use dupes::HashCache;
 
 pub use snapshot::{
     diff, format_timestamp, DiffReport, DirDelta, FileDelta, Snapshot, SnapshotError,
@@ -26,7 +31,6 @@ pub use snapshot::{
 };
 pub use tree::ScanTree;
 
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -48,6 +52,11 @@ pub struct Options {
     /// Threads listing directories (`None` = twice the CPU cores, which keeps
     /// SSDs busy; a spinning disk is better served by 2-4).
     pub threads: Option<usize>,
+    /// Read the NTFS Master File Table instead of listing directories: a
+    /// whole drive in seconds. Needs administrator rights and a local NTFS
+    /// volume, and does not follow links; otherwise the directory walk is
+    /// used. See [`ScanTree::engine`] for which one ran.
+    pub mft: bool,
 }
 
 /// Live progress + cancellation shared with a running scan / duplicate search.
@@ -58,16 +67,49 @@ pub struct Progress {
     files: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
+    phase: Arc<AtomicU64>,
+    total_files: Arc<AtomicU64>,
+    total_bytes: Arc<AtomicU64>,
+}
+
+/// What a duplicate search is doing (see [`Progress::phase`]).
+pub mod phase {
+    /// Listing files (also the only phase of a scan).
+    pub const WALK: u64 = 0;
+    /// Reading the start and end of every same-size candidate.
+    pub const SAMPLE: u64 = 1;
+    /// Hashing whole files that still look alike.
+    pub const HASH: u64 = 2;
 }
 
 impl Progress {
-    /// Files seen so far.
+    /// Files seen (or, past the walk, processed) so far.
     pub fn files(&self) -> u64 {
         self.files.load(Ordering::Relaxed)
     }
-    /// Bytes seen so far.
+    /// Bytes seen (or, past the walk, read) so far.
     pub fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
+    }
+    /// The current [`phase`]; a scan stays in [`phase::WALK`].
+    pub fn phase(&self) -> u64 {
+        self.phase.load(Ordering::Relaxed)
+    }
+    /// Files the current phase will process (0 while walking: unknown).
+    pub fn total_files(&self) -> u64 {
+        self.total_files.load(Ordering::Relaxed)
+    }
+    /// Bytes the current phase will read (0 while walking: unknown).
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes.load(Ordering::Relaxed)
+    }
+    /// Start a new phase: counters restart at 0 against the given totals.
+    fn enter(&self, phase: u64, total_files: u64, total_bytes: u64) {
+        self.files.store(0, Ordering::Relaxed);
+        self.bytes.store(0, Ordering::Relaxed);
+        self.total_files.store(total_files, Ordering::Relaxed);
+        self.total_bytes.store(total_bytes, Ordering::Relaxed);
+        self.phase.store(phase, Ordering::Relaxed);
     }
     /// Ask the running operation to stop as soon as possible.
     pub fn cancel(&self) {
@@ -168,7 +210,7 @@ pub struct ScanReport {
 
 /// A group of byte-identical files (hard links to the same physical file are
 /// collapsed, so `wasted` reflects space that is actually reclaimable).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DupGroup {
     pub hash: String,
     pub size: u64,
@@ -220,13 +262,15 @@ pub struct RemoveReport {
     pub dry_run: bool,
 }
 
-/// First N bytes hashed as a cheap pre-filter before a full-file hash.
-const PREFIX_LEN: usize = 4096;
-
+/// Exclude patterns as one matcher. On Windows names compare without regard
+/// to case, like the filesystem does (`*.DLL` excludes `x.dll`).
 pub(crate) fn build_globset(patterns: &[String]) -> globset::GlobSet {
     let mut builder = globset::GlobSetBuilder::new();
     for p in patterns {
-        if let Ok(g) = globset::Glob::new(p) {
+        if let Ok(g) = globset::GlobBuilder::new(p)
+            .case_insensitive(cfg!(windows))
+            .build()
+        {
             builder.add(g);
         }
     }
@@ -295,7 +339,7 @@ pub(crate) fn on_disk_size(meta: &std::fs::Metadata, path: &Path) -> u64 {
 /// Actual allocated size via `GetCompressedFileSizeW`. Returns `None` on error
 /// so the caller can fall back to the logical length.
 #[cfg(windows)]
-fn compressed_size(path: &Path) -> Option<u64> {
+pub(crate) fn compressed_size(path: &Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     extern "system" {
@@ -350,7 +394,7 @@ pub fn walk_files(root: &Path) -> Vec<FileEntry> {
 /// Every file below `root` (honouring `opts`), in no particular order.
 fn collect_files(root: &Path, opts: &Options, progress: &Progress) -> Vec<FileEntry> {
     let mut files = Vec::new();
-    walk::walk(root, opts, progress, |b| files.extend(b.files));
+    let _ = walk::walk(root, opts, progress, |b| files.extend(b.files));
     files
 }
 
@@ -387,82 +431,33 @@ pub fn find_duplicates(root: &Path, min_size: u64) -> Vec<DupGroup> {
 }
 
 /// Find groups of byte-identical files under `root`, ignoring files smaller than
-/// `min_size` bytes and zero-byte files. Reports live progress and can be cancelled.
+/// `min_size` bytes and zero-byte files. Reports live progress (see
+/// [`Progress::phase`]) and can be cancelled (no groups are returned then).
 ///
-/// Cheap and correct: group by size, collapse hard links, pre-hash the first
-/// [`PREFIX_LEN`] bytes, then full-hash the survivors (BLAKE3). Parallel across
-/// size groups.
+/// Cheap and correct: group by size, open each candidate once (collapsing hard
+/// links and hashing both ends), then BLAKE3 the whole of what still matches —
+/// every step in parallel per file. See [`find_duplicates_cached`] to reuse
+/// hashes between searches.
 pub fn find_duplicates_with_progress(
     root: &Path,
     min_size: u64,
     opts: &Options,
     progress: &Progress,
 ) -> Vec<DupGroup> {
-    // Duplicate detection groups by *logical* (content) size — two byte-identical
-    // files are duplicates regardless of how they happen to be allocated on disk.
-    let files: Vec<FileEntry> = collect_files(root, opts, progress)
-        .into_iter()
-        .filter(|f| f.logical_size >= min_size && f.logical_size > 0)
-        .collect();
+    dupes::find(root, min_size, opts, progress, &HashCache::new())
+}
 
-    let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
-    for f in files {
-        by_size.entry(f.logical_size).or_default().push(f.path);
-    }
-
-    let candidates: Vec<(u64, Vec<PathBuf>)> =
-        by_size.into_iter().filter(|(_, v)| v.len() > 1).collect();
-
-    let mut groups: Vec<DupGroup> = candidates
-        .par_iter()
-        .flat_map(|(size, paths)| {
-            if progress.cancelled() {
-                return Vec::new(); // stop hashing new groups once cancelled
-            }
-            let reps = dedup_hard_links(paths);
-            if reps.len() < 2 {
-                return Vec::new();
-            }
-
-            let mut by_prefix: HashMap<[u8; 32], Vec<PathBuf>> = HashMap::new();
-            for p in reps {
-                if let Ok(h) = hash_prefix(&p, PREFIX_LEN) {
-                    by_prefix.entry(h).or_default().push(p);
-                }
-            }
-
-            let mut out = Vec::new();
-            for prefix_group in by_prefix.into_values() {
-                if prefix_group.len() < 2 {
-                    continue;
-                }
-                let mut by_hash: HashMap<String, Vec<PathBuf>> = HashMap::new();
-                for p in prefix_group {
-                    if let Ok(h) = hash_file(&p) {
-                        by_hash.entry(h).or_default().push(p);
-                    }
-                }
-                for (hash, group) in by_hash {
-                    if group.len() < 2 {
-                        continue;
-                    }
-                    let mut group = group;
-                    group.sort(); // stable order so "keep the first" is deterministic
-                    let wasted = size.saturating_mul(group.len() as u64 - 1);
-                    out.push(DupGroup {
-                        hash,
-                        size: *size,
-                        files: group,
-                        wasted,
-                    });
-                }
-            }
-            out
-        })
-        .collect();
-
-    groups.sort_by_key(|g| std::cmp::Reverse(g.wasted));
-    groups
+/// [`find_duplicates_with_progress`] that takes hashes from `cache` for files
+/// whose size and modification time are unchanged and records what it learns,
+/// so a repeated search only reads files that changed.
+pub fn find_duplicates_cached(
+    root: &Path,
+    min_size: u64,
+    opts: &Options,
+    progress: &Progress,
+    cache: &HashCache,
+) -> Vec<DupGroup> {
+    dupes::find(root, min_size, opts, progress, cache)
 }
 
 /// Reclaim the space of redundant duplicate copies: keep `keep`, act on every
@@ -556,7 +551,7 @@ pub fn remove_path(
             ..Progress::default()
         };
         dirs.push(path.to_path_buf());
-        walk::walk(path, &Options::default(), &listing, |b| {
+        let _ = walk::walk(path, &Options::default(), &listing, |b| {
             for f in b.files {
                 bytes = bytes.saturating_add(f.size);
                 files.push(f.path);
@@ -650,57 +645,6 @@ pub fn remove_path(
         errors,
         dry_run: false,
     }
-}
-
-/// Keep one path per distinct physical file. Hard links share a file identity,
-/// so they must not be counted as duplicates. [`same_file::Handle`] provides that
-/// identity cross-platform. Paths whose identity can't be read are kept.
-fn dedup_hard_links(paths: &[PathBuf]) -> Vec<PathBuf> {
-    let mut seen: HashSet<same_file::Handle> = HashSet::new();
-    let mut reps = Vec::new();
-    for p in paths {
-        match same_file::Handle::from_path(p) {
-            Ok(h) => {
-                if seen.insert(h) {
-                    reps.push(p.clone());
-                }
-            }
-            Err(_) => reps.push(p.clone()),
-        }
-    }
-    reps
-}
-
-fn hash_prefix(path: &Path, len: usize) -> std::io::Result<[u8; 32]> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut buf = vec![0u8; len];
-    let mut read = 0usize;
-    while read < buf.len() {
-        let n = file.read(&mut buf[read..])?;
-        if n == 0 {
-            break;
-        }
-        read += n;
-    }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&buf[..read]);
-    Ok(*hasher.finalize().as_bytes())
-}
-
-fn hash_file(path: &Path) -> std::io::Result<String> {
-    // Memory-map the file so BLAKE3 reads straight from the page cache with no
-    // buffered-read syscalls or intermediate copies — the fast path for the
-    // large files that dominate full-hash cost.
-    let mut hasher = blake3::Hasher::new();
-    if hasher.update_mmap(path).is_ok() {
-        return Ok(hasher.finalize().to_hex().to_string());
-    }
-    // Fallback: stream the file (mmap unsupported, empty, or a special file).
-    let mut hasher = blake3::Hasher::new();
-    let mut file = std::fs::File::open(path)?;
-    std::io::copy(&mut file, &mut hasher)?;
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Format a byte count as a human-readable string, e.g. `1.5 GB`.

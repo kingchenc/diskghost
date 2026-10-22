@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use diskghost_core::{
-    diff, find_duplicates_with_progress, format_timestamp, human_delta, human_size, reclaim,
-    remove_path, validate_globs, DiffReport, DupGroup, Options, Progress, ReclaimAction,
+    diff, find_duplicates_cached, format_timestamp, human_delta, human_size, phase, reclaim,
+    remove_path, validate_globs, DiffReport, DupGroup, HashCache, Options, Progress, ReclaimAction,
     RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot,
 };
 use serde::Serialize;
@@ -28,11 +28,25 @@ fn with_progress<T>(job: impl FnOnce(&Progress) -> T) -> T {
     let (p, d) = (progress.clone(), done.clone());
     let handle = std::thread::spawn(move || {
         while !d.load(Ordering::Relaxed) {
-            eprint!(
-                "\r  working… {} files, {}   ",
-                p.files(),
-                human_size(p.bytes())
-            );
+            match p.phase() {
+                phase::SAMPLE => eprint!(
+                    "\r  comparing file ends… {} / {} files   ",
+                    p.files(),
+                    p.total_files()
+                ),
+                phase::HASH => eprint!(
+                    "\r  hashing… {} / {} files, {} / {}   ",
+                    p.files(),
+                    p.total_files(),
+                    human_size(p.bytes()),
+                    human_size(p.total_bytes())
+                ),
+                _ => eprint!(
+                    "\r  working… {} files, {}   ",
+                    p.files(),
+                    human_size(p.bytes())
+                ),
+            }
             let _ = std::io::stderr().flush();
             std::thread::sleep(std::time::Duration::from_millis(120));
         }
@@ -119,6 +133,10 @@ enum Command {
         /// Actually perform the reclaim (default: dry-run).
         #[arg(long)]
         apply: bool,
+        /// Keep file hashes in this file between runs: a repeated search only
+        /// reads files whose size or modification time changed.
+        #[arg(long, value_name = "FILE")]
+        cache: Option<PathBuf>,
     },
     /// Delete a file or folder — permanently, or to the OS trash. Dry-run by default.
     Rm {
@@ -150,6 +168,11 @@ struct WalkArgs {
     /// spinning disk).
     #[arg(long)]
     threads: Option<usize>,
+    /// Read the NTFS Master File Table instead of listing directories (much
+    /// faster on Windows; needs an administrator console, falls back to the
+    /// directory walk otherwise).
+    #[arg(long)]
+    mft: bool,
 }
 
 impl WalkArgs {
@@ -159,6 +182,7 @@ impl WalkArgs {
             follow_symlinks: self.follow_symlinks,
             exclude: self.exclude.clone(),
             threads: self.threads,
+            mft: self.mft,
         }
     }
 }
@@ -231,6 +255,8 @@ fn main() -> ExitCode {
                 let out = ScanOutput {
                     report: &report,
                     diff: changes.as_ref(),
+                    engine: tree.engine(),
+                    mft_fallback: tree.mft_fallback(),
                 };
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {
@@ -239,7 +265,15 @@ fn main() -> ExitCode {
                     println!();
                     print_diff(d);
                 }
-                println!("\nScanned in {}", fmt_duration(elapsed));
+                let engine = if tree.engine() == "mft" {
+                    " (NTFS MFT)"
+                } else {
+                    ""
+                };
+                println!("\nScanned in {}{engine}", fmt_duration(elapsed));
+                if let Some(why) = tree.mft_fallback() {
+                    eprintln!("note: --mft not used: {why}");
+                }
             }
             if let (Some(file), Some(snap)) = (&save, &snapshot) {
                 if let Err(e) = snap.save(file) {
@@ -279,6 +313,7 @@ fn main() -> ExitCode {
             walk,
             reclaim: reclaim_arg,
             apply,
+            cache,
         } => {
             if !path.is_dir() {
                 eprintln!("error: not a directory: {}", path.display());
@@ -286,9 +321,15 @@ fn main() -> ExitCode {
             }
             warn_invalid_globs(&walk.exclude);
             let opts = walk.to_options();
+            let hashes = cache.as_deref().map(HashCache::load).unwrap_or_default();
             let groups = with_progress(|p| {
-                find_duplicates_with_progress(&path, min_mb * 1024 * 1024, &opts, p)
+                find_duplicates_cached(&path, min_mb * 1024 * 1024, &opts, p, &hashes)
             });
+            if let Some(file) = &cache {
+                if let Err(e) = hashes.save(file) {
+                    eprintln!("warning: cannot save hash cache: {e}");
+                }
+            }
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&groups).unwrap());
             } else {
@@ -345,6 +386,11 @@ struct ScanOutput<'a> {
     report: &'a ScanReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     diff: Option<&'a DiffReport>,
+    /// "walk" or "mft".
+    engine: &'a str,
+    /// Why --mft was asked for but not used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mft_fallback: Option<&'a str>,
 }
 
 fn print_diff(d: &DiffReport) {

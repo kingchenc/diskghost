@@ -167,7 +167,7 @@ fn path_of_key(root: &Path, key: &[u8]) -> PathBuf {
     p
 }
 
-fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+pub(crate) fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         out.push((v as u8) | 0x80);
         v >>= 7;
@@ -184,7 +184,7 @@ fn get_u8(r: &mut impl BufRead) -> Result<u8, SnapshotError> {
     Ok(b)
 }
 
-fn get_varint(r: &mut impl BufRead) -> Result<u64, SnapshotError> {
+pub(crate) fn get_varint(r: &mut impl BufRead) -> Result<u64, SnapshotError> {
     let mut v = 0u64;
     for shift in (0..64).step_by(7) {
         let b = get_u8(r)?;

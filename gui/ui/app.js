@@ -9,6 +9,7 @@ const { invoke } = window.__TAURI__.core;
 const $ = (id) => document.getElementById(id);
 
 let settings = mergeSettings(null);
+let elevated = false; // running as administrator (the MFT engine needs it)
 let drives = [];
 
 // Every scan / duplicate search the user started, oldest first. A job is
@@ -104,6 +105,15 @@ const I18N = {
     setParallel: "Parallel scans", setParallelD: "Scans running at the same time; more wait in the queue. 1 is best for a single HDD.",
     setDupes: "Duplicates", setMinMb: "Ignore files smaller than (MB)",
     setDelete: "Deleting", setTrash: "Send deleted items to the Recycle Bin", setTrashD: "Off deletes permanently.",
+    engineMft: "Ultra — NTFS MFT (administrator)",
+    engineMftD: "Reads the drive's file table (MFT) in one go instead of opening every folder, also for the duplicate search. Pays off most on the system drive C:, where Windows slows folder listing down (measured: 5× faster). On a SATA SSD with millions of files the table is larger than the folders and Fast can be quicker. Needs administrator rights and a local NTFS drive, otherwise Fast is used automatically. OneDrive folders are always read through Windows; links are not followed.",
+    mftNeedsAdmin: "Diskghost is not running as administrator.", restartAdmin: "Restart as administrator",
+    adminDropNote: "Windows does not allow dragging folders from Explorer onto a program running as administrator — use Browse or the drive list there.",
+    adminBadge: "Admin", mftFallback: "MFT not used",
+    phaseWalk: "Listing files", phaseWalkD: "Finding files of the same size…",
+    phaseSample: "Comparing start and end", phaseSampleD: "each file is opened once",
+    phaseHash: "Checking whole contents (BLAKE3)",
+    protSkipped: "Program & game files", protSkippedSub: "not searched — click to include them (searches again)",
     setEngine: "Scan engine", engineFast: "Fast — SSD / NVMe (default)", engineGentle: "Gentle — HDD / in the background",
     engineFastD: "Lists many folders at once (2 threads per CPU core). Fastest on SSDs; on a spinning disk the head jumps around and it can get slower.",
     engineGentleD: "3 threads. Best for spinning disks and network drives, and keeps the PC responsive while it scans — slower on SSDs.",
@@ -198,6 +208,15 @@ const I18N = {
     setParallel: "Parallele Scans", setParallelD: "Gleichzeitig laufende Scans; weitere warten. 1 ist am besten für eine einzelne HDD.",
     setDupes: "Duplikate", setMinMb: "Dateien kleiner als (MB) ignorieren",
     setDelete: "Löschen", setTrash: "Gelöschtes in den Papierkorb", setTrashD: "Aus löscht endgültig.",
+    engineMft: "Ultra — NTFS MFT (Administrator)",
+    engineMftD: "Liest die Dateitabelle (MFT) des Laufwerks am Stück, statt jeden Ordner zu öffnen, auch für die Duplikatsuche. Bringt am meisten auf dem Systemlaufwerk C:, wo Windows das Auflisten bremst (gemessen: 5× schneller). Auf einer SATA-SSD mit Millionen Dateien ist die Tabelle größer als die Ordner, dort kann „Schnell“ schneller sein. Braucht Administratorrechte und ein lokales NTFS-Laufwerk, sonst wird automatisch „Schnell“ benutzt. OneDrive-Ordner werden immer über Windows gelesen; Links werden nicht verfolgt.",
+    mftNeedsAdmin: "Diskghost läuft nicht als Administrator.", restartAdmin: "Als Administrator neu starten",
+    adminDropNote: "Windows erlaubt kein Ziehen von Ordnern aus dem Explorer auf ein Programm mit Administratorrechten — dort Durchsuchen oder die Laufwerksliste nutzen.",
+    adminBadge: "Admin", mftFallback: "MFT nicht benutzt",
+    phaseWalk: "Dateien auflisten", phaseWalkD: "Suche Dateien gleicher Größe…",
+    phaseSample: "Anfang und Ende vergleichen", phaseSampleD: "jede Datei wird einmal geöffnet",
+    phaseHash: "Ganze Inhalte prüfen (BLAKE3)",
+    protSkipped: "Programm- & Spieldateien", protSkippedSub: "nicht durchsucht — klicken zum Einbeziehen (sucht neu)",
     setEngine: "Scan-Engine", engineFast: "Schnell — SSD / NVMe (Standard)", engineGentle: "Schonend — HDD / im Hintergrund",
     engineFastD: "Liest viele Ordner gleichzeitig (2 Threads pro CPU-Kern). Am schnellsten auf SSDs; auf einer HDD springt der Lesekopf hin und her und es kann langsamer werden.",
     engineGentleD: "3 Threads. Am besten für HDDs und Netzlaufwerke, und der PC bleibt beim Scannen flüssig — auf SSDs langsamer.",
@@ -310,6 +329,7 @@ function walkOpts() {
     // "gentle" keeps a spinning disk from seeking itself to death and leaves
     // the machine responsive; "fast" lets the walker pick (2 x CPU threads).
     threads: settings.engine === "gentle" ? 3 : null,
+    mft: settings.engine === "mft",
   };
 }
 
@@ -425,8 +445,15 @@ function renderSettings() {
         field(t("setParallel"), t("setParallelD"), numberInput(settings.parallel, 1, 8, (v) => { set({ parallel: v ?? 2 }); pump(); })),
         checkField(t("setFollow"), t("setFollowD"), settings.follow_symlinks, (v) => set({ follow_symlinks: v }))),
       el("div", { class: "set-grid" },
-        field(t("setEngine"), settings.engine === "gentle" ? t("engineGentleD") : t("engineFastD"),
-          selectInput(settings.engine, [["fast", t("engineFast")], ["gentle", t("engineGentle")]], (v) => set({ engine: v }, true))),
+        field(t("setEngine"), t({ fast: "engineFastD", gentle: "engineGentleD", mft: "engineMftD" }[settings.engine]),
+          selectInput(settings.engine, [["fast", t("engineFast")], ["gentle", t("engineGentle")], ["mft", t("engineMft")]],
+            (v) => set({ engine: v }, true))),
+        settings.engine === "mft" && !elevated
+          ? el("div", { class: "field" },
+            el("span", { class: "fl", text: t("mftNeedsAdmin") }),
+            el("button", { type: "button", class: "primary", onclick: () => invoke("restart_elevated").catch((e) => status(errText(e), true)) }, `🛡 ${t("restartAdmin")}`),
+            el("span", { class: "fd", text: t("adminDropNote") }))
+          : null,
         field(t("setKeep"), t("setKeepD"), numberInput(settings.keep_snapshots, 1, 100, (v) => set({ keep_snapshots: v ?? 10 }))))),
     el("section", { class: "set-sec" },
       el("h2", { text: `${t("setDupes")} & ${t("setDelete")}` }),
@@ -488,10 +515,18 @@ function renderDrives() {
 const active = () => jobs.find((j) => j.id === activeId) || null;
 const byId = (id) => jobs.find((j) => j.id === id);
 
-function enqueue(kind, path, { select = true } = {}) {
+// Walk options of a duplicate search: unless program and game files are
+// included on purpose, they are not even read.
+function dupeOpts(includeProt) {
+  const o = walkOpts();
+  if (!includeProt) o.exclude = [...new Set([...o.exclude, ...protectedExcludes()])];
+  return o;
+}
+
+function enqueue(kind, path, { select = true, includeProt = false } = {}) {
   path = String(path || "").trim();
   if (!path) return status(t("enterPath"), true);
-  const opts = walkOpts();
+  const opts = kind === "dupes" ? dupeOpts(includeProt) : walkOpts();
   // The same scan again: just show it (Rescan walks it afresh).
   const same = jobs.find((j) => j.kind === kind && j.root === path && j.state !== "error" &&
     JSON.stringify(j.opts) === JSON.stringify(opts));
@@ -503,6 +538,7 @@ function enqueue(kind, path, { select = true } = {}) {
     id: nextId++, kind, root: path, path, opts, top: settings.top, mb: settings.min_mb,
     state: "queued", files: 0, bytes: 0, startedAt: 0, elapsedMs: null,
     view: null, groups: null, error: null, tab: "folders",
+    includeProt,
     cache: new Map(), // folder -> view, so going back is instant
     back: [], // folders visited before, for Back
   };
@@ -553,6 +589,7 @@ async function runJob(j) {
       j.returnTo = null;
       if (back && back !== j.root) navigate(j, back, { keepTab: true, record: false });
       if (!view.cancelled) autoCompare(j);
+      if (view.mft_fallback) status(`${t("mftFallback")}: ${view.mft_fallback}`, true);
     } else {
       j.groups = await invoke("find_dupes", { job: j.id, path: j.root, mb: j.mb, opts: j.opts });
       j.elapsedMs = performance.now() - j.startedAt;
@@ -603,7 +640,7 @@ function selectJob(id) {
 }
 
 function rescan(j) {
-  j.opts = walkOpts();
+  j.opts = j.kind === "dupes" ? dupeOpts(j.includeProt) : walkOpts();
   j.top = settings.top;
   j.mb = settings.min_mb;
   j.returnTo = j.kind === "scan" ? j.path : null;
@@ -813,16 +850,41 @@ function queuedView(j) {
     el("div", {}, el("button", { type: "button", onclick: () => closeJob(j) }, t("removeFromQueue")))));
 }
 
+// Title, 0..1 fraction (or null) and detail line of a running job: a scan
+// estimates against the drive's used space, a duplicate search reports its
+// three phases against their known totals.
+function progressInfo(j) {
+  if (j.kind !== "dupes") {
+    const est = estimate(j);
+    return {
+      title: `${t("stRunning")}${j.opts?.mft ? " · NTFS MFT" : ""}`,
+      frac: est,
+      detail: est == null ? t("noEstimate") : `≈ ${pct(est, 1)} ${t("estimated")}`,
+    };
+  }
+  const ph = j.phase || 0;
+  const title = `${ph + 1}/3 · ${t(["phaseWalk", "phaseSample", "phaseHash"][ph])}`;
+  if (ph === 0 || !j.totalFiles) return { title, frac: null, detail: t("phaseWalkD") };
+  if (ph === 1) {
+    return { title, frac: j.files / j.totalFiles, detail: `${num(j.files)} / ${num(j.totalFiles)} ${t("files")} · ${t("phaseSampleD")}` };
+  }
+  return {
+    title,
+    frac: j.totalBytes ? j.bytes / j.totalBytes : j.files / j.totalFiles,
+    detail: `${human(j.bytes)} / ${human(j.totalBytes)} · ${num(j.files)} / ${num(j.totalFiles)} ${t("files")}`,
+  };
+}
+
 function progressView(j) {
   const secs = (performance.now() - j.startedAt) / 1000;
-  const est = estimate(j);
+  const p = progressInfo(j);
   return el("div", { class: "center" }, el("div", { class: "card progress-card" },
-    el("h2", { text: j.kind === "dupes" ? t("stSearching") : t("stRunning") }),
+    el("h2", { id: "pv-title", text: p.title }),
     el("div", { class: "path", text: j.root }),
     el("div", { class: "big", id: "pv-bytes", text: human(j.bytes) }),
-    el("div", { class: "meter big" + (est == null ? " indeterminate" : ""), id: "pv-meter" },
-      el("span", { class: "used", style: est == null ? {} : { width: `${est * 100}%` } })),
-    el("div", { class: "muted", id: "pv-est", text: est == null ? t("noEstimate") : `≈ ${pct(est, 1)} ${t("estimated")}` }),
+    el("div", { class: "meter big" + (p.frac == null ? " indeterminate" : ""), id: "pv-meter" },
+      el("span", { class: "used", style: p.frac == null ? {} : { width: `${p.frac * 100}%` } })),
+    el("div", { class: "muted", id: "pv-est", text: p.detail }),
     el("div", { class: "progress-grid" },
       kpi(t("kFiles"), num(j.files), null, { id: "pv-files" }),
       kpi(t("elapsed"), fmtMs(secs * 1000), null, { id: "pv-time" }),
@@ -835,15 +897,17 @@ function progressView(j) {
 function updateProgressView(j) {
   const secs = (performance.now() - j.startedAt) / 1000;
   const set = (id, v) => { const n = $(id); if (n) n.querySelector?.(".v") ? (n.querySelector(".v").textContent = v) : (n.textContent = v); };
+  const p = progressInfo(j);
+  set("pv-title", p.title);
   set("pv-bytes", human(j.bytes));
   set("pv-files", num(j.files));
   set("pv-time", fmtMs(secs * 1000));
   set("pv-rate", secs > 0.5 ? num(Math.round(j.files / secs)) : "–");
-  const est = estimate(j);
-  if (est != null) {
-    const bar = $("pv-meter")?.firstChild;
-    if (bar) bar.style.width = `${est * 100}%`;
-    set("pv-est", `≈ ${pct(est, 1)} ${t("estimated")}`);
+  set("pv-est", p.detail);
+  const meter = $("pv-meter");
+  if (meter) {
+    meter.classList.toggle("indeterminate", p.frac == null);
+    meter.firstChild.style.width = p.frac == null ? "" : `${Math.min(1, p.frac) * 100}%`;
   }
 }
 
@@ -939,7 +1003,7 @@ function kpiRow(j, v) {
       el("span", { class: "meter" }, el("span", { class: used / v.disk_total > 0.9 ? "hot" : "used", style: { width: `${(100 * used) / v.disk_total}%` } }))));
   }
   const secs = (j.elapsedMs || 0) / 1000;
-  row.append(kpi(t("kScan"), fmtMs(j.elapsedMs || 0),
+  row.append(kpi(v.engine === "mft" ? `${t("kScan")} · NTFS MFT` : t("kScan"), fmtMs(j.elapsedMs || 0),
     `${secs > 0 ? `${num(Math.round(v.total_files / secs))} ${t("rate")} · ` : ""}${v.skipped ? `${num(v.skipped)} ${t("kSkipped")}` : t("kNoSkip")}`,
     {}, v.skipped ? "" : ""));
   if (j.diff) {
@@ -1502,8 +1566,11 @@ function dupesView(j) {
   const sum = (list) => list.reduce((a, g) => a + g.wasted, 0);
   wrap.append(el("div", { class: "kpis" },
     kpi(t("ownReclaim"), human(sum(own)), `${num(own.length)} ${t("groups")} · ${num(own.reduce((a, g) => a + g.files.length, 0))} ${t("files")}`),
-    kpi(t("protHidden"), human(sum(prot)), `${num(prot.length)} ${t("groups")} — ${t("protHiddenSub")}`,
-      { role: "button", tabindex: "0", style: { cursor: "pointer" }, onclick: () => { j.dupShowProt = !j.dupShowProt; renderMain(); } }),
+    j.includeProt
+      ? kpi(t("protHidden"), human(sum(prot)), `${num(prot.length)} ${t("groups")} — ${t("protHiddenSub")}`,
+        { role: "button", tabindex: "0", style: { cursor: "pointer" }, onclick: () => { j.dupShowProt = !j.dupShowProt; renderMain(); } })
+      : kpi(t("protSkipped"), "—", t("protSkippedSub"),
+        { role: "button", tabindex: "0", style: { cursor: "pointer" }, onclick: () => { j.includeProt = true; j.dupShowProt = true; rescan(j); } }),
     kpi(t("kScan"), fmtMs(j.elapsedMs || 0), null)));
   wrap.append(el("div", { class: "muted", text: t("dupHint") }));
 
@@ -1672,6 +1739,9 @@ try {
     const j = e.payload && byId(e.payload.job);
     if (!j || j.state !== "running") return;
     j.files = e.payload.files;
+    j.phase = e.payload.phase;
+    j.totalFiles = e.payload.total_files;
+    j.totalBytes = e.payload.total_bytes;
     j.bytes = e.payload.bytes;
     if (paintQueued) return;
     paintQueued = true;
@@ -1723,7 +1793,10 @@ try {
 } catch (_) { /* events unavailable */ }
 
 (async function start() {
-  invoke("app_version").then((v) => { $("version").textContent = `v${v}`; }).catch(() => {});
+  Promise.all([invoke("app_version").catch(() => ""), invoke("is_elevated").catch(() => false)]).then(([v, admin]) => {
+    elevated = Boolean(admin);
+    $("version").textContent = `${v ? `v${v}` : ""}${elevated ? ` · ${t("adminBadge")}` : ""}`;
+  });
   try { settings = mergeSettings(await invoke("load_settings")); } catch (_) { /* defaults */ }
   applyI18n();
   updateExcludeChip();

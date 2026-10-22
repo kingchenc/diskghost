@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use diskghost_core::{
-    diff, disk_space, find_duplicates_with_progress, reclaim, remove_path, validate_globs,
-    DiffReport, DirSize, DupGroup, FileStats, Options, Progress, ReclaimAction, ReclaimReport,
+    diff, disk_space, find_duplicates_cached, reclaim, remove_path, validate_globs, DiffReport,
+    DirSize, DupGroup, FileStats, HashCache, Options, Progress, ReclaimAction, ReclaimReport,
     RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot,
 };
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,9 @@ type Shared = Arc<RwLock<Cached>>;
 struct AppState {
     jobs: Mutex<HashMap<u64, Progress>>,
     trees: Mutex<HashMap<u64, Shared>>,
+    /// File hashes of earlier duplicate searches (loaded on first use, saved
+    /// after each search), so searching again only reads changed files.
+    hashes: Mutex<Option<Arc<HashCache>>>,
 }
 
 /// Payload pushed to the frontend as a scan/search runs.
@@ -59,6 +62,23 @@ struct ProgressPayload {
     job: u64,
     files: u64,
     bytes: u64,
+    /// Duplicate search phase (0 listing, 1 comparing ends, 2 hashing).
+    phase: u64,
+    total_files: u64,
+    total_bytes: u64,
+}
+
+impl ProgressPayload {
+    fn of(job: u64, p: &Progress) -> ProgressPayload {
+        ProgressPayload {
+            job,
+            files: p.files(),
+            bytes: p.bytes(),
+            phase: p.phase(),
+            total_files: p.total_files(),
+            total_bytes: p.total_bytes(),
+        }
+    }
 }
 
 /// Walk options coming from the frontend.
@@ -70,6 +90,8 @@ struct WalkOpts {
     follow_symlinks: bool,
     /// `None` = automatic.
     threads: Option<usize>,
+    /// Read the NTFS Master File Table (needs administrator rights).
+    mft: bool,
 }
 
 impl WalkOpts {
@@ -79,6 +101,7 @@ impl WalkOpts {
             follow_symlinks: self.follow_symlinks,
             exclude: self.exclude.clone(),
             threads: self.threads,
+            mft: self.mft,
         }
     }
 }
@@ -93,6 +116,10 @@ struct View {
     nested: Vec<Vec<DirSize>>,
     /// Bytes per extension and per size range below the viewed folder.
     stats: FileStats,
+    /// How the tree was read: "mft" or "walk".
+    engine: &'static str,
+    /// Why the MFT was asked for but not used.
+    mft_fallback: Option<String>,
 }
 
 fn view_of(tree: &ScanTree, path: &Path, top: usize) -> Option<View> {
@@ -110,6 +137,8 @@ fn view_of(tree: &ScanTree, path: &Path, top: usize) -> Option<View> {
         report,
         nested,
         stats,
+        engine: tree.engine(),
+        mft_fallback: tree.mft_fallback().map(str::to_string),
     })
 }
 
@@ -145,14 +174,7 @@ fn all_trees(app: &tauri::AppHandle) -> Vec<Shared> {
 fn spawn_emitter(app: tauri::AppHandle, job: u64, progress: Progress, done: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         while !done.load(Ordering::Relaxed) {
-            let _ = app.emit(
-                "progress",
-                ProgressPayload {
-                    job,
-                    files: progress.files(),
-                    bytes: progress.bytes(),
-                },
-            );
+            let _ = app.emit("progress", ProgressPayload::of(job, &progress));
             std::thread::sleep(std::time::Duration::from_millis(120));
         }
     });
@@ -191,14 +213,9 @@ impl Drop for Running {
             jobs.remove(&self.job);
         }
         // A last event with the final counts.
-        let _ = self.app.emit(
-            "progress",
-            ProgressPayload {
-                job: self.job,
-                files: self.progress.files(),
-                bytes: self.progress.bytes(),
-            },
-        );
+        let _ = self
+            .app
+            .emit("progress", ProgressPayload::of(self.job, &self.progress));
     }
 }
 
@@ -456,14 +473,34 @@ async fn find_dupes(
         if !p.is_dir() {
             return Err(format!("not a directory: {path}"));
         }
-        Ok(find_duplicates_with_progress(
+        let file = hash_cache_file(&app)?;
+        let cache = {
+            let state = app.state::<AppState>();
+            let mut slot = state.hashes.lock().map_err(|e| e.to_string())?;
+            slot.get_or_insert_with(|| Arc::new(HashCache::load(&file)))
+                .clone()
+        };
+        let groups = find_duplicates_cached(
             &p,
             mb * 1024 * 1024,
             &opts.to_options(),
             &running.progress,
-        ))
+            &cache,
+        );
+        drop(running);
+        // Persist in the background; the result is shown right away.
+        std::thread::spawn(move || {
+            let _ = cache.save(&file);
+        });
+        Ok(groups)
     })
     .await
+}
+
+/// Where duplicate-search hashes are kept between runs.
+fn hash_cache_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(base.join("hashes.bin"))
 }
 
 /// Request cancellation of job `job`, if it is still running.
@@ -599,6 +636,69 @@ async fn pick_folders(app: tauri::AppHandle) -> Result<Vec<String>, String> {
 #[tauri::command]
 async fn check_globs(patterns: Vec<String>) -> Vec<String> {
     validate_globs(&patterns)
+}
+
+/// Whether the app runs with administrator rights (needed for the MFT engine).
+#[tauri::command]
+fn is_elevated() -> bool {
+    #[cfg(windows)]
+    {
+        #[link(name = "shell32")]
+        extern "system" {
+            fn IsUserAnAdmin() -> i32;
+        }
+        unsafe { IsUserAnAdmin() != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Start the app again with administrator rights (Windows asks for consent)
+/// and quit this instance. An error if the user declined.
+#[tauri::command]
+fn restart_elevated(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                op: *const u16,
+                file: *const u16,
+                params: *const u16,
+                dir: *const u16,
+                show: i32,
+            ) -> isize;
+        }
+        let wide = |s: &std::ffi::OsStr| -> Vec<u16> {
+            s.encode_wide().chain(std::iter::once(0)).collect()
+        };
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let (op, file) = (wide("runas".as_ref()), wide(exe.as_os_str()));
+        let r = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                op.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1, // SW_SHOWNORMAL
+            )
+        };
+        if r <= 32 {
+            return Err("administrator rights were not granted".into());
+        }
+        app.exit(0);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Err("only available on Windows".into())
+    }
 }
 
 /// The app's version, for the title bar.
@@ -826,6 +926,7 @@ fn main() {
             app.manage(AppState {
                 jobs: Mutex::new(HashMap::new()),
                 trees: Mutex::new(HashMap::new()),
+                hashes: Mutex::new(None),
             });
             place_window(app.handle());
             Ok(())
@@ -846,7 +947,9 @@ fn main() {
             check_globs,
             load_settings,
             save_settings,
-            app_version
+            app_version,
+            is_elevated,
+            restart_elevated
         ])
         .run(tauri::generate_context!())
         .expect("error while running Diskghost");

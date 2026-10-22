@@ -13,16 +13,29 @@ Find where your space went, hunt down byte-identical duplicates, and reclaim the
   come straight from the directory listing (no file is opened), every scan has
   its own thread pool, and the tree is built while the walk is still running:
   4.9 M files / 1.2 TB on an NVMe SSD in about 6 s.
-- **Correct duplicate detection** — group by size → **collapse hard links**
-  (same physical file, so `wasted` is real) → **first-block pre-hash** → full
-  **BLAKE3** hash, all in parallel.
+- **Correct, fast duplicate detection** — group by size → open every
+  candidate **once** (collapsing **hard links**, so `wasted` is real, and
+  hashing its first and last 16 KB) → full **BLAKE3** only for what still
+  matches; every step parallel per file, big files hashed on several threads.
+  An optional **hash cache** (`--cache`, automatic in the GUI) remembers hashes
+  by path, size and modification time: searching the same place again only
+  reads files that changed (a 461-group Steam library: 1.2 s → 0.1 s).
 - **Reclaim duplicates** — delete, send to the **OS trash/recycle bin**, or
   replace a copy with a **hard link**. Dry-run by default.
 - **Delete a file or folder** — `diskghost rm <path>`, permanently or to the OS
   trash. Parallel unlink for speed, never follows symlinks (can't escape the
   target), refuses a drive root, dry-run by default, reports how long it took.
-- **Scan options** — exclude globs (`node_modules`, `*.tmp`), max depth,
-  follow-symlinks, `--threads` (2-4 suit a spinning disk).
+- **Scan options** — exclude globs (`node_modules`, `*.tmp`; case-insensitive
+  on Windows), max depth, follow-symlinks, `--threads` (2-4 suit a spinning
+  disk), `--mft`.
+- **NTFS MFT engine** (`--mft`, Windows, administrator) — reads the volume's
+  Master File Table in large parallel blocks and builds the tree straight from
+  its records instead of opening every folder. Measured on a system drive:
+  `C:\Users\me` 196 s → 37 s, all of C: (4.8 M files, 4.9 M folders) in about
+  30 s. On a SATA SSD with millions of files the table is bigger than the
+  folders and the normal walk can be quicker. Cloud placeholders and OneDrive
+  folders are sized and listed through Windows; without rights or NTFS it falls
+  back to the walk and says why.
 - **Live progress + cancel** — long scans report files/bytes and can be stopped;
   a cancelled scan is clearly labelled as a partial result.
 - **One walk, whole tree** — the scan builds an in-memory tree, so the GUI
@@ -129,7 +142,8 @@ A modern Tauri UI lives in `gui/`:
   temp files, Windows/macOS system files …), turn single patterns off, or add
   your own; patterns are validated before they are used.
 - **Settings** — scan engine (**Fast** for SSD/NVMe: many directories at once;
-  **Gentle** for spinning disks, network drives or scanning in the background),
+  **Gentle** for spinning disks, network drives or scanning in the background;
+  **Ultra** = the NTFS MFT engine, with a *restart as administrator* button),
   list length, max depth, symlinks, parallel scans, snapshots kept per folder,
   duplicate minimum size, Recycle Bin vs. permanent delete, window size at start
   (1440p if it fits the screen, otherwise maximized; or 1080p / 4K / maximized),
@@ -138,7 +152,9 @@ A modern Tauri UI lives in `gui/`:
   whole file), whatever the names. Copies inside installed programs and games
   (Steam, Epic, Battle.net, Program Files, …; DLLs, game archives) are there on
   purpose, so they are hidden by default, shown with a lock when asked for, and
-  never removed while hidden; the program's copy is the one kept. **Folder
+  never removed while hidden (by default not even read: the search skips
+  them); the program's copy is the one kept. The search shows its three phases
+  with progress, and hashes are cached between runs. **Folder
   pairs** sums up which folders share identical files; filter by category or
   name, then reclaim with one click (dry-run first).
 - **What changed** — every complete scan is kept as a snapshot (in the
@@ -197,6 +213,7 @@ Diskghost/
 - [x] GUI dashboard: parallel scans + queue, drives, nested treemap, file-type and size-range charts, exclude templates, settings
 - [x] Own parallel walker (no per-file open), file-level snapshots (zstd, streaming diff), non-blocking GUI
 - [x] Automatic "since last scan" comparison; duplicate finder that protects program and game files, folder pairs
+- [x] NTFS MFT engine (administrator), per-file parallel duplicate pipeline with a persistent hash cache
 
 ## Development
 

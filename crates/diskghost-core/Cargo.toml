@@ -10,8 +10,7 @@ description = "Fast parallel disk scanning and duplicate detection — the engin
 
 [dependencies]
 rayon = "1"
-blake3 = { version = "1", features = ["mmap"] }
-same-file = "1"
+blake3 = { version = "1", features = ["mmap", "rayon"] }
 globset = "0.4"
 trash = "5"
 fs4 = "1"
