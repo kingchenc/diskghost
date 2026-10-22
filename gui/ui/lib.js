@@ -273,6 +273,44 @@
     return `${short(lo)} – ${short(hi)}`;
   }
 
+  // Folders whose files belong to installed programs and games: duplicates in
+  // there are on purpose (each game ships its own copy of a DLL, a game keeps
+  // two copies of a sound bank) and deleting one breaks the program.
+  const PROTECTED_DIRS = new Set([
+    "steamapps", "program files", "program files (x86)", "programdata", "windows", "windowsapps",
+    "xboxgames", "wpsystem", "epic games", "riot games", "battle.net", "ubisoft", "ubisoft game launcher",
+    "ea games", "electronic arts", "origin games", "gog galaxy", "gog games", "rockstar games",
+    "roberts space industries", "bluestacks", "appdata", "node_modules", "site-packages", ".venv", "venv", ".git",
+  ]);
+  const PROTECTED_EXTS = new Set(["pck", "cab", "sld", "bk2", "bik", "vtf", "mdl", "pdb", "ttf", "otf"]);
+
+  // Whether `path` is part of an installed program or game (by folder or by
+  // file type) rather than one of the user's own files.
+  function isProtectedPath(path) {
+    const parts = String(path).split(/[\\/]+/);
+    const name = parts[parts.length - 1] || "";
+    const ext = (name.match(/\.([^.]+)$/) || [])[1] || "";
+    const cat = categoryOf(ext);
+    if (cat === "program" || cat === "gamedata" || PROTECTED_EXTS.has(ext.toLowerCase())) return true;
+    return parts.slice(0, -1).some((p) => PROTECTED_DIRS.has(p.toLowerCase()));
+  }
+
+  // Duplicate groups by the set of folders their copies sit in, so "these
+  // two folders share 300 identical files" is one line instead of 300.
+  function folderSets(groups) {
+    const sets = new Map();
+    for (const g of groups) {
+      const dirs = [...new Set(g.files.map((f) => parentPath(f) || f))].sort();
+      const key = dirs.join("\n");
+      const s = sets.get(key) || { key, dirs, groups: 0, files: 0, wasted: 0 };
+      s.groups += 1;
+      s.files += g.files.length;
+      s.wasted += g.wasted;
+      sets.set(key, s);
+    }
+    return [...sets.values()].sort((a, b) => b.wasted - a.wasted || a.key.localeCompare(b.key));
+  }
+
   // The drive a path lives on ("c:", "\\server\share", "/"), for scheduling.
   function driveKey(path) {
     const p = String(path);
@@ -339,5 +377,6 @@
     human, humanDelta, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
     pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
     categorize, bucketLabel, jobsToStart, driveKey, mapItems, parentPath, isUnder, SETTINGS_VERSION,
+    isProtectedPath, folderSets,
   };
 });

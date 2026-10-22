@@ -27,15 +27,19 @@ struct Cached {
     /// Views already computed, by folder and list length — going back to a
     /// folder is answered without touching the tree again.
     views: HashMap<(PathBuf, usize), Arc<View>>,
-    /// The tree captured as a snapshot (for comparisons), once taken.
-    current: Option<Arc<Snapshot>>,
+    /// The tree captured as a snapshot (for comparisons), once taken. A
+    /// mutex of its own, so it can be filled under the tree's read lock and a
+    /// second caller waits for the first capture instead of repeating it.
+    current: Mutex<Option<Arc<Snapshot>>>,
 }
 
 impl Cached {
     /// Forget everything derived from the tree (it was changed).
     fn changed(&mut self) {
         self.views.clear();
-        self.current = None;
+        if let Ok(c) = self.current.get_mut() {
+            *c = None;
+        }
     }
 }
 
@@ -238,16 +242,13 @@ fn store_snapshot(dir: &Path, snap: &Snapshot, keep: usize) -> Result<(), String
 
 /// Capture the tree as a snapshot once and keep it for comparisons.
 fn current_snapshot(shared: &Shared) -> Result<Arc<Snapshot>, String> {
-    if let Some(s) = shared.read().map_err(|e| e.to_string())?.current.clone() {
-        return Ok(s);
+    let c = shared.read().map_err(|e| e.to_string())?;
+    let mut current = c.current.lock().map_err(|e| e.to_string())?;
+    if let Some(s) = current.as_ref() {
+        return Ok(s.clone());
     }
-    let snap = {
-        let c = shared.read().map_err(|e| e.to_string())?;
-        Arc::new(Snapshot::capture(&c.tree))
-    };
-    if let Ok(mut c) = shared.write() {
-        c.current = Some(snap.clone());
-    }
+    let snap = Arc::new(Snapshot::capture(&c.tree));
+    *current = Some(snap.clone());
     Ok(snap)
 }
 
@@ -277,7 +278,7 @@ async fn scan_dir(
         let shared: Shared = Arc::new(RwLock::new(Cached {
             tree,
             views: HashMap::new(),
-            current: None,
+            current: Mutex::new(None),
         }));
         if let Ok(mut trees) = app.state::<AppState>().trees.lock() {
             trees.insert(job, shared.clone());

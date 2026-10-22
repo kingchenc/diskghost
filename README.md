@@ -134,11 +134,19 @@ A modern Tauri UI lives in `gui/`:
   duplicate minimum size, Recycle Bin vs. permanent delete, window size at start
   (1440p if it fits the screen, otherwise maximized; or 1080p / 4K / maximized),
   language. The version is shown next to the name.
-- **Find duplicates** to sort/filter groups and reclaim their space with one
-  click. Every complete scan is kept as a snapshot (in the background, so the
-  result shows at once); **Changes** lists them with their size on disk,
-  compares the folder on screen against any of them — folders and single files
-  — and tints the treemap and folder rows by what grew or shrank.
+- **Find duplicates** — every group is byte-identical content (BLAKE3 over the
+  whole file), whatever the names. Copies inside installed programs and games
+  (Steam, Epic, Battle.net, Program Files, …; DLLs, game archives) are there on
+  purpose, so they are hidden by default, shown with a lock when asked for, and
+  never removed while hidden; the program's copy is the one kept. **Folder
+  pairs** sums up which folders share identical files; filter by category or
+  name, then reclaim with one click (dry-run first).
+- **What changed** — every complete scan is kept as a snapshot (in the
+  background, so the result shows at once), and right after a scan a **Since
+  last scan** card compares it with the previous one. **Compare** / **Changes**
+  lists the snapshots with their size on disk, compares the folder on screen
+  against any of them — folders and single files — and tints the treemap and
+  folder rows by what grew or shrank.
 - **Never blocking** — every command runs off the UI thread and each scan has
   its own lock, so browsing one scan never waits for another.
 
@@ -188,6 +196,7 @@ Diskghost/
 - [x] Snapshots &amp; "what grew since last time" (CLI `--save`/`--since`/`diff`, GUI history)
 - [x] GUI dashboard: parallel scans + queue, drives, nested treemap, file-type and size-range charts, exclude templates, settings
 - [x] Own parallel walker (no per-file open), file-level snapshots (zstd, streaming diff), non-blocking GUI
+- [x] Automatic "since last scan" comparison; duplicate finder that protects program and game files, folder pairs
 
 ## Development
 
