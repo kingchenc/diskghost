@@ -233,3 +233,34 @@ test("isUnder respects separators and Windows case rules", () => {
   assert.ok(!lib.isUnder("/home/Me", "/home/me"));
   assert.ok(!lib.isUnder("/homer", "/home"));
 });
+
+test("isProtectedPath tells program and game files from the user's own", () => {
+  // By folder (any depth, any case) ...
+  assert.ok(lib.isProtectedPath("G:\\Steam\\steamapps\\common\\Patron\\Data\\Maps\\Map_16\\Forest.bmp"));
+  assert.ok(lib.isProtectedPath("C:\\Program Files\\App\\readme.txt"));
+  assert.ok(lib.isProtectedPath("G:\\Epic Games\\Games\\GTAV\\x64\\metadata.dat"));
+  assert.ok(lib.isProtectedPath("/home/me/proj/node_modules/a/index.js"));
+  // ... or by file type, wherever it sits.
+  assert.ok(lib.isProtectedPath("D:\\Downloads\\setup\\libcef.DLL"));
+  assert.ok(lib.isProtectedPath("D:\\Stuff\\sound.pck"));
+  // The user's own files are not.
+  assert.ok(!lib.isProtectedPath("D:\\Photos\\2024\\IMG_0001.jpg"));
+  assert.ok(!lib.isProtectedPath("C:\\Users\\me\\Videos\\clip.mp4"));
+  assert.ok(!lib.isProtectedPath("/home/me/Documents/report.pdf"));
+});
+
+test("folderSets groups duplicates by the folders their copies are in", () => {
+  const a = "G:\\Halo\\Sound\\SFX", b = "G:\\Halo\\subgames\\CampaignS1\\Sound\\SFX";
+  const sets = lib.folderSets([
+    { files: [`${a}\\x.pck`, `${b}\\x.pck`], wasted: 100 },
+    { files: [`${b}\\y.pck`, `${a}\\y.pck`], wasted: 50 },
+    { files: ["D:\\P\\1.jpg", "D:\\P\\copy of 1.jpg"], wasted: 500 },
+  ]);
+  assert.equal(sets.length, 2);
+  assert.deepEqual(sets[0].dirs, ["D:\\P"]);
+  assert.deepEqual(sets[1].dirs, [a, b]);
+  assert.equal(sets[1].groups, 2);
+  assert.equal(sets[1].files, 4);
+  assert.equal(sets[1].wasted, 150);
+  assert.deepEqual(lib.folderSets([]), []);
+});

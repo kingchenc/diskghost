@@ -66,11 +66,20 @@ const I18N = {
     changes: "Changes since", unchanged: "Nothing changed.", newBadge: "new",
     grew: "Grew", shrank: "Shrank", newFolders: "New folders", removedFolders: "Removed folders",
     newFiles: "New files", removedFiles: "Removed files", changedFiles: "Changed files", biggest: "biggest",
+    sinceLast: "Since last scan", firstScanShort: "first scan — compared from the next one on", clickDetails: "click for details",
+    newShort: "new", goneShort: "gone", changedShort: "changed",
     oldSnapshotNoFiles: "That snapshot comes from an older version and only knows folders — file changes show up from the next comparison on.",
     snapshots: "Saved snapshots", onDisk: "on disk", thisScan: "this scan", filesAndFolders: "files & folders",
     foldersOnly: "folders only", compare: "Compare", deleteSnapshot: "Delete this snapshot?",
     snapshotsHint: (n) => `Every complete scan is saved automatically (all folders and files, compressed); the newest ${n} per folder are kept — see Settings.`,
-    noDupes: "No duplicates found 🎉", groups: "groups", reclaimable: "reclaimable",
+    noDupes: "No duplicates found 🎉", noOwnDupes: "No duplicates among your own files 🎉 — program and game files are hidden.",
+    ownReclaim: "Your files — reclaimable", protHidden: "Program & game files (hidden)", protHiddenSub: "click to show",
+    dupHint: "Every group is byte-for-byte identical content (BLAKE3 over the whole file), whatever the names. Installed programs and games keep such copies on purpose — deleting one breaks them, so they are hidden and never removed while hidden.",
+    showProt: "Show program & game files", identical: "identical", protBadge: "program / game",
+    protWhy: "Part of an installed program or game (by folder or file type) — deleting it can break that program.",
+    protWarn: "This includes files of installed programs or games. They may stop working.",
+    tabGroups: "Groups", tabFolderSets: "Folder pairs", colFolders: "Folders sharing identical files",
+    folderFilter: "Only", sameFolder: "copies within this folder", nothingToReclaim: "Nothing to reclaim in the shown groups.", groups: "groups", reclaimable: "reclaimable",
     filter: "Filter", sort: "Sort", dryRun: "Dry-run", reclaimShown: "Reclaim shown",
     sortWasted: "wasted", sortSize: "size", sortCount: "count",
     actTrash: "→ Recycle Bin", actDelete: "Delete", actHardlink: "Hard-link",
@@ -153,11 +162,20 @@ const I18N = {
     changes: "Änderungen seit", unchanged: "Nichts geändert.", newBadge: "neu",
     grew: "Gewachsen", shrank: "Geschrumpft", newFolders: "Neue Ordner", removedFolders: "Entfernte Ordner",
     newFiles: "Neue Dateien", removedFiles: "Entfernte Dateien", changedFiles: "Geänderte Dateien", biggest: "die größten",
+    sinceLast: "Seit letztem Scan", firstScanShort: "erster Scan — Vergleich ab dem nächsten", clickDetails: "klicken für Details",
+    newShort: "neu", goneShort: "weg", changedShort: "geändert",
     oldSnapshotNoFiles: "Dieser Snapshot stammt aus einer älteren Version und kennt nur Ordner — Dateiänderungen gibt es ab dem nächsten Vergleich.",
     snapshots: "Gespeicherte Snapshots", onDisk: "auf der Platte", thisScan: "dieser Scan", filesAndFolders: "Dateien & Ordner",
     foldersOnly: "nur Ordner", compare: "Vergleichen", deleteSnapshot: "Diesen Snapshot löschen?",
     snapshotsHint: (n) => `Jeder vollständige Scan wird automatisch gespeichert (alle Ordner und Dateien, komprimiert); die neuesten ${n} pro Ordner bleiben — siehe Einstellungen.`,
-    noDupes: "Keine Duplikate gefunden 🎉", groups: "Gruppen", reclaimable: "freigebbar",
+    noDupes: "Keine Duplikate gefunden 🎉", noOwnDupes: "Keine Duplikate unter deinen eigenen Dateien 🎉 — Programm- und Spieldateien sind ausgeblendet.",
+    ownReclaim: "Deine Dateien — freigebbar", protHidden: "Programm- & Spieldateien (ausgeblendet)", protHiddenSub: "klicken zum Anzeigen",
+    dupHint: "Jede Gruppe ist Byte für Byte identischer Inhalt (BLAKE3 über die ganze Datei), egal wie die Dateien heißen. Installierte Programme und Spiele haben solche Kopien absichtlich — Löschen macht sie kaputt, deshalb sind sie ausgeblendet und werden dann nie entfernt.",
+    showProt: "Programm- & Spieldateien zeigen", identical: "identisch", protBadge: "Programm / Spiel",
+    protWhy: "Gehört zu einem installierten Programm oder Spiel (nach Ordner oder Dateityp) — Löschen kann es beschädigen.",
+    protWarn: "Darunter sind Dateien installierter Programme oder Spiele. Sie könnten danach nicht mehr funktionieren.",
+    tabGroups: "Gruppen", tabFolderSets: "Ordner-Paare", colFolders: "Ordner mit identischen Dateien",
+    folderFilter: "Nur", sameFolder: "Kopien in diesem Ordner", nothingToReclaim: "In den angezeigten Gruppen gibt es nichts freizugeben.", groups: "Gruppen", reclaimable: "freigebbar",
     filter: "Filter", sort: "Sortierung", dryRun: "Testlauf", reclaimShown: "Angezeigte freigeben",
     sortWasted: "verschwendet", sortSize: "Größe", sortCount: "Anzahl",
     actTrash: "→ Papierkorb", actDelete: "Löschen", actHardlink: "Hardlink",
@@ -534,10 +552,13 @@ async function runJob(j) {
       const back = j.returnTo;
       j.returnTo = null;
       if (back && back !== j.root) navigate(j, back, { keepTab: true, record: false });
+      if (!view.cancelled) autoCompare(j);
     } else {
       j.groups = await invoke("find_dupes", { job: j.id, path: j.root, mb: j.mb, opts: j.opts });
       j.elapsedMs = performance.now() - j.startedAt;
       j.keep = new Map();
+      j.tagged = false;
+      j.dupSet = null;
       j.state = j.cancelRequested ? "cancelled" : "done";
     }
   } catch (e) {
@@ -586,6 +607,7 @@ function rescan(j) {
   j.top = settings.top;
   j.mb = settings.min_mb;
   j.returnTo = j.kind === "scan" ? j.path : null;
+  j.auto = null;
   j.state = "queued";
   pump();
   renderAll();
@@ -665,8 +687,10 @@ function jobSub(j) {
   }
   if (j.state === "error") return `${t("stError")}: ${j.error}`;
   if (j.kind === "dupes" && j.groups) {
-    const wasted = j.groups.reduce((a, g) => a + g.wasted, 0);
-    return `${j.groups.length} ${t("groups")} · ${human(wasted)} ${t("reclaimable")}`;
+    // Counted like the view: only the user's own files are reclaimable.
+    tagGroups(j);
+    const own = j.groups.filter((g) => !g.allProt);
+    return `${own.length} ${t("groups")} · ${human(own.reduce((a, g) => a + g.wasted, 0))} ${t("reclaimable")}`;
   }
   if (j.view) {
     const tag = j.state === "cancelled" ? `${t("stCancelled")} · ` : "";
@@ -860,6 +884,7 @@ function scanView(j) {
     el("button", { type: "button", class: "small", title: t("upHint"), disabled: !parent || !isUnder(parent, j.root), onclick: () => goUp(j) }, `↑ ${t("up")}`),
     crumbBar(j),
     el("span", { class: "grow" }),
+    el("button", { type: "button", class: "small", onclick: () => openCompare(j) }, `⇄ ${t("compare")}`),
     el("button", { type: "button", class: "small", onclick: () => enqueue("dupes", j.path) }, `👯 ${t("dupesHere")}`),
     el("button", { type: "button", class: "small", onclick: () => rescan(j) }, `↻ ${t("rescan")}`));
   view.append(el("div", { class: "full", style: { display: "flex", flexDirection: "column", gap: "12px" } },
@@ -921,8 +946,63 @@ function kpiRow(j, v) {
     const tint = deltaTint(j.diff.delta, Math.abs(j.diff.delta));
     row.append(kpi(`${t("kSince")} ${fmtDate(j.diff.old_taken_at)}`, humanDelta(j.diff.delta),
       `${human(j.diff.old_size)} → ${human(j.diff.new_size)}`, {}, tint.cls));
+  } else if (j.path === j.root && j.auto) {
+    row.append(sinceLastCard(j));
   }
   return row;
+}
+
+// "Since last scan": filled in by autoCompare() right after a scan; a click
+// opens the full comparison.
+function sinceLastCard(j) {
+  const open = { role: "button", tabindex: "0", style: { cursor: "pointer" }, onclick: () => openCompare(j) };
+  const a = j.auto;
+  if (a.state === "loading") return kpi(t("sinceLast"), "…", t("comparing"), open);
+  if (a.state === "none") return kpi(t("sinceLast"), "—", t("firstScanShort"), open);
+  if (a.state !== "done") return kpi(t("sinceLast"), "?", a.error || "", open);
+  const d = a.diff;
+  const files = d.files_compared
+    ? ` · ${num(d.new_files_count)} ${t("newShort")}, ${num(d.removed_files_count)} ${t("goneShort")}, ${num(d.changed_files_count)} ${t("changedShort")}`
+    : "";
+  return kpi(`${t("sinceLast")} (${fmtDate(d.old_taken_at)})`, humanDelta(d.delta), `${t("clickDetails")}${files}`, open,
+    deltaTint(d.delta, Math.abs(d.delta)).cls);
+}
+
+// Compare a finished scan with the newest earlier snapshot of its root.
+async function autoCompare(j) {
+  j.auto = { state: "loading" };
+  renderFor(j);
+  try {
+    j.history = (await invoke("list_snapshots", { job: j.id })).snapshots || [];
+    const older = j.history.filter((s) => s.taken_at < j.scanUnix);
+    if (!older.length) {
+      j.auto = { state: "none" };
+    } else {
+      const diff = await invoke("diff_since", { job: j.id, path: j.root, takenAt: older[0].taken_at, top: j.top });
+      j.auto = { state: "done", diff };
+    }
+  } catch (e) {
+    j.auto = { state: "error", error: errText(e) };
+  }
+  if (byId(j.id)) renderFor(j);
+}
+
+// The Compare button / card: show the changes tab with a comparison of the
+// folder on screen against the newest earlier snapshot.
+async function openCompare(j) {
+  j.tab = "changes";
+  if (j.path === j.root && j.auto?.state === "done") {
+    j.diff = j.auto.diff;
+    j.sinceAt = j.diff.old_taken_at;
+    return renderMain();
+  }
+  renderMain();
+  if (!j.history) {
+    try { j.history = (await invoke("list_snapshots", { job: j.id })).snapshots || []; } catch (_) { j.history = []; }
+  }
+  const older = j.history.filter((s) => s.taken_at < j.scanUnix);
+  if (older.length) await showChanges(j, j.sinceAt ?? older[0].taken_at);
+  else renderMain();
 }
 
 function diskCard(v) {
@@ -1380,6 +1460,30 @@ async function deletePath(path) {
 }
 
 // -------------------------------- duplicates --------------------------------
+// A group is files with byte-identical content (BLAKE3 over the whole file,
+// hard links collapsed) — whatever they are called. Copies inside installed
+// programs and games are on purpose (every game ships its own DLLs, some ship
+// sound banks twice) and deleting one breaks the program, so groups made only
+// of such files are hidden unless asked for, and they are never removed while
+// hidden.
+function tagGroups(j) {
+  if (j.tagged) return;
+  for (const g of j.groups) {
+    g.prot = g.files.map(isProtectedPath);
+    g.allProt = g.prot.every(Boolean);
+    g.anyProt = g.prot.some(Boolean);
+    g.cat = categoryOf((String(g.files[0]).match(/\.([^.\\/]+)$/) || [])[1] || "");
+  }
+  j.tagged = true;
+}
+
+// Groups that pass the program/game switch, the category and the folder filter.
+function baseGroups(j) {
+  tagGroups(j);
+  return j.groups.filter((g) => (j.dupShowProt || !g.allProt) && (!j.dupCat || g.cat === j.dupCat) &&
+    (!j.dupSet || folderSets([g])[0].key === j.dupSet));
+}
+
 function dupesView(j) {
   const groups = j.groups || [];
   const wrap = el("div", { class: "dupview" });
@@ -1392,45 +1496,91 @@ function dupesView(j) {
     wrap.append(el("div", { class: "card" }, el("div", { class: "ok", style: { fontSize: "18px" }, text: t("noDupes") })));
     return wrap;
   }
-  const totalWasted = groups.reduce((a, g) => a + g.wasted, 0);
-  const totalFiles = groups.reduce((a, g) => a + g.files.length, 0);
+  tagGroups(j);
+  const own = groups.filter((g) => !g.allProt);
+  const prot = groups.filter((g) => g.allProt);
+  const sum = (list) => list.reduce((a, g) => a + g.wasted, 0);
   wrap.append(el("div", { class: "kpis" },
-    kpi(t("reclaimable"), human(totalWasted), null),
-    kpi(t("groups"), num(groups.length), `${num(totalFiles)} ${t("files")}`),
+    kpi(t("ownReclaim"), human(sum(own)), `${num(own.length)} ${t("groups")} · ${num(own.reduce((a, g) => a + g.files.length, 0))} ${t("files")}`),
+    kpi(t("protHidden"), human(sum(prot)), `${num(prot.length)} ${t("groups")} — ${t("protHiddenSub")}`,
+      { role: "button", tabindex: "0", style: { cursor: "pointer" }, onclick: () => { j.dupShowProt = !j.dupShowProt; renderMain(); } }),
     kpi(t("kScan"), fmtMs(j.elapsedMs || 0), null)));
+  wrap.append(el("div", { class: "muted", text: t("dupHint") }));
 
-  const list = el("div", { class: "dupes" });
-  const filter = el("input", { type: "text", value: j.dupFilter || "", oninput: (e) => { j.dupFilter = e.target.value; fill(); } });
+  const filter = el("input", { type: "text", value: j.dupFilter || "", placeholder: t("filterFiles"), oninput: (e) => { j.dupFilter = e.target.value; fill(); } });
+  const showProt = el("input", { type: "checkbox", onchange: (e) => { j.dupShowProt = e.target.checked; renderMain(); } });
+  showProt.checked = Boolean(j.dupShowProt);
+  const cats = [...new Set(groups.map((g) => g.cat))];
   const sort = selectInput(j.dupSort || "wasted", [["wasted", t("sortWasted")], ["size", t("sortSize")], ["count", t("sortCount")]],
     (val) => { j.dupSort = val; fill(); });
   const action = selectInput(j.dupAction || "trash", [["trash", t("actTrash")], ["delete", t("actDelete")], ["hardlink", t("actHardlink")]],
     (val) => { j.dupAction = val; });
   wrap.append(el("div", { class: "dupbar" },
-    el("span", { class: "sum", text: `${groups.length} ${t("groups")} — ${human(totalWasted)} ${t("reclaimable")}` }),
-    el("label", { class: "inlabel" }, `${t("filter")} `, filter),
+    el("label", { class: "inlabel" }, showProt, ` ${t("showProt")}`),
+    selectInput(j.dupCat || "", [["", t("allCategories")], ...cats.map((c) => [c, `${catIcon[c]} ${t(`cat_${c}`)}`])],
+      (val) => { j.dupCat = val; renderMain(); }),
+    filter,
     el("label", { class: "inlabel" }, `${t("sort")} `, sort),
+    el("span", { class: "grow", style: { flex: "1" } }),
     action,
     el("button", { type: "button", onclick: () => reclaimShown(j, true) }, t("dryRun")),
-    el("button", { type: "button", class: "danger", onclick: () => reclaimShown(j, false) }, t("reclaimShown"))), list);
+    el("button", { type: "button", class: "danger", onclick: () => reclaimShown(j, false) }, t("reclaimShown"))));
+
+  if (j.dupSet) {
+    wrap.append(el("div", { class: "chips" },
+      el("span", { class: "chip" }, `📁 ${t("folderFilter")}: ${j.dupSetDirs.map((d) => baseName(d)).join(" ⇄ ")}`,
+        el("button", { type: "button", class: "x", title: t("close"), onclick: () => { j.dupSet = null; renderMain(); } }, "✕"))));
+  }
+
+  const tab = j.dupTab || "groups";
+  wrap.append(el("div", { class: "tabs" },
+    [["groups", t("tabGroups")], ["sets", t("tabFolderSets")]].map(([id, label]) =>
+      el("button", { type: "button", class: `tab${tab === id ? " on" : ""}`, onclick: () => { j.dupTab = id; renderMain(); } }, label))));
+  const list = el("div", { class: "dupes" });
+  wrap.append(list);
 
   function fill() {
     const shown = computeShown(j);
     const frag = document.createDocumentFragment();
-    for (const g of shown.slice(0, 1000)) {
-      const box = el("div", { class: "dup" });
-      box.append(el("div", { class: "dhead" },
-        el("span", { class: "badge", text: `${g.files.length}×` }),
-        ` ${human(g.size)} `,
-        el("span", { class: "waste", text: `${human(g.wasted)} ${t("reclaimable")}` })));
-      const kept = keptPath(j, g);
-      for (const f of g.files) {
-        const radio = el("input", { type: "radio", name: `keep-${g.hash}`, title: t("keep"), onchange: () => { j.keep.set(g.hash, f); fill(); } });
-        if (f === kept) radio.checked = true;
-        box.append(el("label", { class: `dupfile${f === kept ? " kept" : ""}` }, radio, el("span", { class: "path", text: f })));
+    if (tab === "sets") {
+      const sets = folderSets(shown);
+      const table = el("table", { class: "table" },
+        el("thead", {}, el("tr", {}, el("th", { text: t("colFolders") }), el("th", { class: "num", text: t("groups") }),
+          el("th", { class: "num", text: t("colFiles") }), el("th", { class: "num", text: t("reclaimable") }))),
+        el("tbody", {}, sets.slice(0, 500).map((s) => el("tr", {
+          class: "click",
+          onclick: () => { j.dupSet = s.key; j.dupSetDirs = s.dirs; j.dupTab = "groups"; renderMain(); },
+        },
+        el("td", { class: "namecell" }, s.dirs.length === 1
+          ? [el("div", { class: "nm", text: `${baseName(s.dirs[0])} — ${t("sameFolder")}` }), el("div", { class: "pth", text: s.dirs[0] })]
+          : s.dirs.map((d) => el("div", { class: "pth", text: `📁 ${d}` }))),
+        el("td", { class: "num", text: num(s.groups) }),
+        el("td", { class: "num", text: num(s.files) }),
+        el("td", { class: "num", text: human(s.wasted) })))));
+      frag.append(table);
+    } else {
+      for (const g of shown.slice(0, 1000)) {
+        const box = el("div", { class: "dup" });
+        box.append(el("div", { class: "dhead" },
+          el("span", { class: "badge", text: `${g.files.length}×` }),
+          ` ${human(g.size)} `,
+          el("span", { class: "chip", title: `BLAKE3 ${g.hash}`, text: `✓ ${t("identical")}` }),
+          el("span", { class: "muted", text: `${catIcon[g.cat]} ${t(`cat_${g.cat}`)}` }),
+          g.anyProt ? el("span", { class: "chip bad", title: t("protWhy"), text: `🔒 ${t("protBadge")}` }) : null,
+          el("span", { class: "waste", text: `${human(g.wasted)} ${t("reclaimable")}` })));
+        const kept = keptPath(j, g);
+        g.files.forEach((f, i) => {
+          const radio = el("input", { type: "radio", name: `keep-${g.hash}`, title: t("keep"), onchange: () => { j.keep.set(g.hash, f); fill(); } });
+          if (f === kept) radio.checked = true;
+          box.append(el("label", { class: `dupfile${f === kept ? " kept" : ""}` }, radio,
+            g.prot[i] ? el("span", { title: t("protWhy"), text: "🔒" }) : null,
+            el("span", { class: "path", text: f })));
+        });
+        frag.append(box);
       }
-      frag.append(box);
+      if (shown.length > 1000) frag.append(el("div", { class: "muted", text: `… ${t("showing")} 1000 / ${num(shown.length)} ${t("groups")}` }));
+      if (!shown.length) frag.append(el("div", { class: "ok", text: j.dupShowProt ? t("noDupes") : t("noOwnDupes") }));
     }
-    if (shown.length > 1000) frag.append(el("div", { class: "muted", text: `… ${t("showing")} 1000 / ${num(shown.length)} ${t("groups")}` }));
     list.replaceChildren(frag);
   }
   fill();
@@ -1440,25 +1590,42 @@ function dupesView(j) {
 function computeShown(j) {
   const filter = (j.dupFilter || "").toLowerCase();
   const sort = j.dupSort || "wasted";
-  const groups = j.groups.filter((g) => !filter || g.files.some((f) => f.toLowerCase().includes(filter)));
+  const groups = baseGroups(j).filter((g) => !filter || g.files.some((f) => f.toLowerCase().includes(filter)));
   groups.sort((a, b) => (sort === "size" ? b.size - a.size : sort === "count" ? b.files.length - a.files.length : b.wasted - a.wasted));
   return groups;
 }
 
-const keptPath = (j, g) => j.keep.get(g.hash) ?? g.files[0];
+// The copy kept by default: a program's own file if the group has one (so
+// the user's stray copy is what goes), else the first.
+function keptPath(j, g) {
+  const chosen = j.keep.get(g.hash);
+  if (chosen) return chosen;
+  const i = g.prot ? g.prot.indexOf(true) : -1;
+  return g.files[i >= 0 ? i : 0];
+}
 
 async function reclaimShown(j, dryRun) {
   const action = j.dupAction || "trash";
+  // While program and game files are hidden, none of them is ever removed.
   const reclaimJobs = computeShown(j)
-    .map((g) => { const keep = keptPath(j, g); return { keep, remove: g.files.filter((f) => f !== keep), size: g.size }; })
+    .map((g) => {
+      const keep = keptPath(j, g);
+      const remove = g.files.filter((f, i) => f !== keep && (j.dupShowProt || !g.prot[i]));
+      return { keep, remove, size: g.size, prot: remove.some(isProtectedPath) };
+    })
     .filter((x) => x.remove.length > 0);
-  if (!reclaimJobs.length) return;
+  if (!reclaimJobs.length) return status(t("nothingToReclaim"));
   const count = reclaimJobs.reduce((a, x) => a + x.remove.length, 0);
+  const touchesProt = reclaimJobs.some((x) => x.prot);
   const label = { trash: t("actTrash"), delete: t("actDelete"), hardlink: t("actHardlink") }[action];
-  if (!dryRun && !(await ask(t("reclaimConfirm")(label, count), action === "trash" ? [] : [{ text: t("irreversible"), cls: "error" }], t("ok"), action !== "trash"))) return;
+  const warn = [
+    action === "trash" ? null : { text: t("irreversible"), cls: "error" },
+    touchesProt ? { text: t("protWarn"), cls: "error" } : null,
+  ].filter(Boolean);
+  if (!dryRun && !(await ask(t("reclaimConfirm")(label, count), warn, t("ok"), action !== "trash" || touchesProt))) return;
   status(dryRun ? `${t("dryRun")}…` : t("deleting"));
   try {
-    const rep = await invoke("reclaim_dupes", { jobs: reclaimJobs, action, dryRun });
+    const rep = await invoke("reclaim_dupes", { jobs: reclaimJobs.map(({ keep, remove, size }) => ({ keep, remove, size })), action, dryRun });
     status(`${rep.dry_run ? "DRY-RUN" : "OK"}: ${num(rep.removed)} ${t("files")}, ${human(rep.reclaimed)} ${t("reclaimable")}` +
       (rep.errors.length ? `, ${rep.errors.length} ${t("errors")}` : ""), rep.errors.length > 0);
     if (!rep.dry_run) {
@@ -1467,6 +1634,7 @@ async function reclaimShown(j, dryRun) {
         o.cache.clear();
         o.stale = true;
       }
+      j.tagged = false;
       rescan(j);
       loadDrives();
     }
