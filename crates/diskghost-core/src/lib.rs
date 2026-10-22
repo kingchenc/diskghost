@@ -96,6 +96,44 @@ pub struct DirSize {
     pub file_count: u64,
 }
 
+/// Bytes and file count of one file extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtStat {
+    /// Lower-cased extension without the dot (`""` for files without one).
+    pub ext: String,
+    pub size: u64,
+    pub count: u64,
+}
+
+/// Files whose size falls below `upper` (and at or above the previous
+/// bucket's bound). The last bucket has no upper bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeBucket {
+    pub upper: Option<u64>,
+    pub size: u64,
+    pub count: u64,
+}
+
+/// What a directory's files are made of: bytes per extension (largest first)
+/// and how the files spread over size ranges.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStats {
+    pub extensions: Vec<ExtStat>,
+    pub size_buckets: Vec<SizeBucket>,
+}
+
+/// Upper bounds of the [`SizeBucket`]s: 4 KB, 64 KB, 1 MB, 16 MB, 128 MB,
+/// 1 GB, 4 GB, then everything bigger.
+pub const SIZE_BUCKET_BOUNDS: [u64; 7] = [
+    4 << 10,
+    64 << 10,
+    1 << 20,
+    16 << 20,
+    128 << 20,
+    1 << 30,
+    4 << 30,
+];
+
 /// Summary of a scan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanReport {

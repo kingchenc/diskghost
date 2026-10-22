@@ -7,36 +7,55 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <header class="topbar">
-      <div class="brand"><span class="ghost" aria-hidden="true">👻</span> Diskghost</div>
-      <div class="tagline">fast disk usage &amp; duplicate finder</div>
-    </header>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand"><span class="ghost" aria-hidden="true">👻</span> Diskghost</div>
+        <form id="pathform" class="pathbox" autocomplete="off">
+          <label class="sr-only" for="path" data-i18n="pathLabel">Folder path</label>
+          <input id="path" type="text" spellcheck="false" data-i18n-ph="placeholder" />
+          <button id="btn-browse" type="button" data-i18n="browse">Browse…</button>
+          <button id="btn-scan" class="primary" type="submit" data-i18n="scan">Scan</button>
+          <button id="btn-dupes" type="button" data-i18n="dupes">Find duplicates</button>
+        </form>
+        <button id="btn-excludes" class="chip-btn" type="button"></button>
+        <button id="btn-settings" class="icon-btn" type="button" data-i18n-title="settings" aria-label="Settings">⚙</button>
+      </header>
 
-    <section class="controls" aria-label="Scan controls">
-      <div class="pathrow">
-        <label class="sr-only" for="path" data-i18n="pathLabel">Folder path</label>
-        <input id="path" type="text" spellcheck="false" data-i18n-ph="placeholder" />
-        <button id="btn-browse" type="button" data-i18n="browse">Browse…</button>
-      </div>
-      <div class="opts">
-        <label><span data-i18n="top">Top</span> <input id="top" type="number" value="20" min="1" max="1000" /></label>
-        <label><span data-i18n="minmb">Min MB</span> <input id="mb" type="number" value="1" min="0" max="1000000" /></label>
-        <label><span data-i18n="depth">Max depth</span> <input id="depth" type="number" min="1" max="100" placeholder="∞" /></label>
-        <label><span data-i18n="exclude">Exclude</span> <input id="exclude" type="text" placeholder="node_modules, *.tmp" /></label>
-        <label class="chk"><input id="follow" type="checkbox" /> <span data-i18n="follow">Follow symlinks</span></label>
-        <label class="chk"><input id="trashmode" type="checkbox" checked /> <span data-i18n="trashMode">Delete → Recycle Bin</span></label>
-      </div>
-      <div class="actions">
-        <button id="btn-scan" class="primary" type="button" data-i18n="scan">Scan size</button>
-        <button id="btn-rescan" type="button" data-i18n="rescan" title="Walk the disk again instead of using the cached tree">Rescan</button>
-        <button id="btn-dupes" type="button" data-i18n="dupes">Find duplicates</button>
-        <button id="btn-cancel" class="danger" type="button" style="display: none" data-i18n="cancel">Cancel</button>
-      </div>
-    </section>
+      <aside class="sidebar">
+        <section class="side-sec">
+          <div class="side-head">
+            <h3 data-i18n="drives">Drives</h3>
+            <button id="btn-drives-refresh" class="link-btn" type="button" data-i18n-title="refresh">↻</button>
+          </div>
+          <div id="drives" class="drives"></div>
+          <button id="btn-scan-all" type="button" class="wide" data-i18n="scanAll">Scan all drives</button>
+        </section>
+        <section class="side-sec grow">
+          <div class="side-head">
+            <h3 data-i18n="scans">Scans</h3>
+            <button id="btn-clear-done" class="link-btn" type="button" data-i18n="clearDone">Clear finished</button>
+          </div>
+          <div id="jobs" class="jobs"></div>
+          <p class="hint" data-i18n="dropHint">Drop folders anywhere — each one is queued as its own scan.</p>
+        </section>
+      </aside>
 
-    <nav id="crumbs" class="crumbs" aria-label="Path breadcrumb"></nav>
-    <div id="status" class="status" role="status" aria-live="polite"></div>
-    <main id="results" tabindex="-1"></main>
+      <main id="main" tabindex="-1"></main>
+
+      <footer class="statusbar">
+        <span id="status" role="status" aria-live="polite"></span>
+        <span id="queue-info"></span>
+      </footer>
+    </div>
+
+    <div id="dropzone" class="dropzone" aria-hidden="true">
+      <div class="dropcard"><div class="dropicon">📂</div><div data-i18n="dropHere">Drop folders to scan them</div></div>
+    </div>
+
+    <div id="tooltip" class="tooltip" role="tooltip"></div>
+
+    <dialog id="settings-dlg" class="dlg"></dialog>
+    <dialog id="confirm-dlg" class="dlg small"></dialog>
 
     <script src="lib.js"></script>
     <script src="app.js"></script>

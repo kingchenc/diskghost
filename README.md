@@ -32,8 +32,8 @@ Find where your space went, hunt down byte-identical duplicates, and reclaim the
   works at any depth. The GUI keeps a history per scanned folder automatically.
 - **Three faces, one Rust core**:
   - a **CLI** with `--json` output for scripts and agents (headless);
-  - a **modern desktop GUI** (Tauri) with a treemap, folder picker, drag &amp; drop
-    and one-click reclaim.
+  - a **modern desktop GUI** (Tauri) with a dashboard per scan, several scans
+    side by side, drive overview, exclude templates and one-click reclaim.
 
 ## Install
 
@@ -98,14 +98,33 @@ Perfect for wiring into an automation/agent that decides what to clean.
 
 ## Desktop app (GUI)
 
-A modern Tauri UI lives in `gui/` — **Browse** or drag a folder onto the window,
-hit **Scan size** for a treemap + biggest folders/files (click a tile or a
-breadcrumb to drill in and back up — served from the in-memory tree, so it is
-instant; **Rescan** walks the disk again), or **Find duplicates** to sort/filter
-groups and reclaim their space with one click. Scans show live progress and can
-be cancelled. Every complete scan is kept as a snapshot; pick an earlier one
-under **Since** and **Show changes** colours the treemap and folder bars by what
-grew or shrank and lists new and removed folders. From `gui/src-tauri`:
+A modern Tauri UI lives in `gui/`:
+
+- **Many scans at once** — drop any number of folders onto the window, pick
+  several with **Browse**, click a drive, or **Scan all drives**. Each scan gets
+  its own entry in the sidebar with live progress (drive scans show an estimate
+  against the drive's used space); a configurable number run in parallel, the
+  rest wait in a queue. Switch between finished scans without losing your place.
+- **Dashboard per scan** — headline cards (size and share of the drive, files and
+  average size, folders, biggest folder and file, free space, scan speed and
+  skipped entries), a **two-level treemap** (each big folder frames its own
+  biggest sub-folders, with hover details), the drive split into this folder /
+  everything else / free, and **what it is made of** by file type. Tabs below
+  list folders, the biggest files (filterable), every extension, the spread over
+  size ranges, and the changes since an earlier scan. Click anything to drill in
+  — served from the in-memory tree, so it is instant; **Rescan** walks again.
+- **Exclude templates** — switch on well-known build output, caches and system
+  files per ecosystem (Node, Python, Rust, .NET, Gradle, C/C++, VCS, IDE folders,
+  temp files, Windows/macOS system files …), turn single patterns off, or add
+  your own; patterns are validated before they are used.
+- **Settings** — list length, max depth, symlinks, parallel scans, duplicate
+  minimum size, Recycle Bin vs. permanent delete, window size at start (1440p if
+  it fits the screen, otherwise maximized; or 1080p / 4K / maximized), language.
+- **Find duplicates** to sort/filter groups and reclaim their space with one
+  click. Every complete scan is kept as a snapshot; **Changes** compares against
+  an earlier one and tints the treemap and folder rows by what grew or shrank.
+
+From `gui/src-tauri`:
 
 ```bash
 cargo tauri dev      # run the app
@@ -144,6 +163,7 @@ Diskghost/
 - [x] CI (fmt/clippy/test/bench on 3 OS) + release binaries with checksums + GUI installers
 - [x] Interactive treemap drill-up / breadcrumbs, served from an in-memory tree
 - [x] Snapshots &amp; "what grew since last time" (CLI `--save`/`--since`/`diff`, GUI history)
+- [x] GUI dashboard: parallel scans + queue, drives, nested treemap, file-type and size-range charts, exclude templates, settings
 
 ## Development
 

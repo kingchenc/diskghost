@@ -11,7 +11,10 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::{disk_space, walk, DirSize, FileEntry, Options, Progress, ScanReport};
+use crate::{
+    disk_space, walk, DirSize, ExtStat, FileEntry, FileStats, Options, Progress, ScanReport,
+    SizeBucket, SIZE_BUCKET_BOUNDS,
+};
 
 struct Node {
     path: PathBuf,
@@ -175,20 +178,81 @@ impl ScanTree {
         Some(self.report_of(id, top_n))
     }
 
-    fn report_of(&self, id: usize, top_n: usize) -> ScanReport {
-        let node = &self.nodes[id];
+    /// The `top_n` biggest immediate sub-folders of `path`, largest first —
+    /// the `children` of its report without the rest. `None` if `path` is not
+    /// in the tree.
+    pub fn children(&self, path: &Path, top_n: usize) -> Option<Vec<DirSize>> {
+        let &id = self.index.get(path)?;
+        Some(self.children_of(id, top_n))
+    }
 
-        let mut kids: Vec<&Node> = node.children.iter().map(|&c| &self.nodes[c]).collect();
-        kids.sort_by_key(|k| Reverse(k.size));
-        let children: Vec<DirSize> = kids
+    fn children_of(&self, id: usize, top_n: usize) -> Vec<DirSize> {
+        let mut kids: Vec<&Node> = self.nodes[id]
+            .children
             .iter()
+            .map(|&c| &self.nodes[c])
+            .collect();
+        kids.sort_by_key(|k| Reverse(k.size));
+        kids.iter()
             .take(top_n)
             .map(|k| DirSize {
                 path: k.path.clone(),
                 size: k.size,
                 file_count: k.file_count,
             })
+            .collect()
+    }
+
+    /// Bytes per file extension and per size range for every file at or
+    /// below `path`. `None` if `path` is not in the tree.
+    pub fn file_stats(&self, path: &Path) -> Option<FileStats> {
+        let &id = self.index.get(path)?;
+        let mut by_ext: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut buckets: Vec<SizeBucket> = SIZE_BUCKET_BOUNDS
+            .iter()
+            .map(|&b| Some(b))
+            .chain(std::iter::once(None))
+            .map(|upper| SizeBucket {
+                upper,
+                size: 0,
+                count: 0,
+            })
             .collect();
+        let mut stack = vec![id];
+        while let Some(i) = stack.pop() {
+            let n = &self.nodes[i];
+            for f in &n.files {
+                let ext = f
+                    .path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let e = by_ext.entry(ext).or_default();
+                e.0 += f.size;
+                e.1 += 1;
+                let b = SIZE_BUCKET_BOUNDS
+                    .iter()
+                    .position(|&bound| f.size < bound)
+                    .unwrap_or(SIZE_BUCKET_BOUNDS.len());
+                buckets[b].size += f.size;
+                buckets[b].count += 1;
+            }
+            stack.extend(n.children.iter().copied());
+        }
+        let mut extensions: Vec<ExtStat> = by_ext
+            .into_iter()
+            .map(|(ext, (size, count))| ExtStat { ext, size, count })
+            .collect();
+        extensions.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.ext.cmp(&b.ext)));
+        Some(FileStats {
+            extensions,
+            size_buckets: buckets,
+        })
+    }
+
+    fn report_of(&self, id: usize, top_n: usize) -> ScanReport {
+        let node = &self.nodes[id];
+        let children = self.children_of(id, top_n);
 
         let root_files_size = node.files.iter().map(|f| f.size).sum();
         let root_files_count = node.files.len() as u64;
@@ -437,6 +501,48 @@ mod tests {
         // Disk space can be refreshed in place.
         tree.refresh_disk_space();
         assert_eq!(tree.root_report(1).disk_total, before.disk_total);
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn children_and_file_stats_cover_the_subtree() {
+        let d = tmpdir("stats");
+        write(&d.join("a/movie.MKV"), &[0u8; 2_000_000]);
+        write(&d.join("a/x/clip.mkv"), &[0u8; 100_000]);
+        write(&d.join("b/notes.txt"), &[0u8; 100_000]);
+        write(&d.join("b/README"), &[0u8; 100_000]);
+        let tree = ScanTree::build(&d, &Options::default(), &Progress::default());
+
+        let kids = tree.children(&d, 10).unwrap();
+        assert_eq!(kids, tree.root_report(10).children);
+        assert_eq!(tree.children(&d, 1).unwrap().len(), 1);
+        assert!(tree.children(&d.join("nope"), 10).is_none());
+
+        let s = tree.file_stats(&d).unwrap();
+        let total = tree.root_report(1).total_size;
+        // Extensions are lower-cased; files without one share "".
+        let exts: Vec<(&str, u64)> = s
+            .extensions
+            .iter()
+            .map(|e| (e.ext.as_str(), e.count))
+            .collect();
+        assert_eq!(exts[0], ("mkv", 2));
+        assert!(exts.contains(&("txt", 1)));
+        assert!(exts.contains(&("", 1)));
+        assert_eq!(s.extensions.iter().map(|e| e.size).sum::<u64>(), total);
+        // 100 KB files land in 64 KB..1 MB, the 2 MB one in 1..16 MB.
+        assert_eq!(s.size_buckets.len(), SIZE_BUCKET_BOUNDS.len() + 1);
+        assert_eq!(s.size_buckets[2].count, 3);
+        assert_eq!(s.size_buckets[3].count, 1);
+        assert_eq!(s.size_buckets.last().unwrap().upper, None);
+        assert_eq!(s.size_buckets.iter().map(|b| b.size).sum::<u64>(), total);
+
+        // A sub-folder only counts its own subtree.
+        let a = tree.file_stats(&d.join("a")).unwrap();
+        assert_eq!(a.extensions.len(), 1);
+        assert_eq!(a.extensions[0].count, 2);
+        assert!(tree.file_stats(&d.join("nope")).is_none());
 
         std::fs::remove_dir_all(&d).ok();
     }

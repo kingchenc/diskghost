@@ -105,3 +105,109 @@ test("changesByPath indexes grown, shrunk and added folders", () => {
   assert.equal(map.has("/d"), false);
   assert.equal(lib.changesByPath({}).maxAbs, 0);
 });
+
+test("pct rounds by magnitude and handles empty wholes", () => {
+  assert.equal(lib.pct(1, 0), "");
+  assert.equal(lib.pct(50, 100), "50%");
+  assert.equal(lib.pct(5, 100), "5.0%");
+  assert.equal(lib.pct(1, 100_000), "<0.1%");
+  assert.equal(lib.pct(0, 100), "0.0%");
+});
+
+test("mergeSettings keeps valid values and repairs the rest", () => {
+  assert.deepEqual(lib.mergeSettings(null), lib.DEFAULT_SETTINGS);
+  const s = lib.mergeSettings({
+    top: 5000, parallel: 0, max_depth: 3, trash: false, presets: ["node", "nope"],
+    custom: [{ pattern: " *.iso " }, { pattern: "", on: true }, { pattern: "x", on: false }, null],
+    window_size: "8k", language: "de", bogus: 1,
+  });
+  assert.equal(s.top, 1000);
+  assert.equal(s.parallel, 1);
+  assert.equal(s.max_depth, 3);
+  assert.equal(s.trash, false);
+  assert.deepEqual(s.presets, ["node"]);
+  assert.deepEqual(s.custom, [{ pattern: "*.iso", on: true }, { pattern: "x", on: false }]);
+  assert.equal(s.window_size, "auto");
+  assert.equal(s.language, "de");
+  assert.equal("bogus" in s, false);
+  // The defaults themselves are never shared or mutated.
+  s.presets.push("rust");
+  assert.deepEqual(lib.DEFAULT_SETTINGS.presets, []);
+});
+
+test("activeExcludes unions templates and custom patterns", () => {
+  const s = lib.mergeSettings({
+    presets: ["rust", "vcs"],
+    preset_off: ["vcs:.hg"],
+    custom: [{ pattern: "target", on: true }, { pattern: "*.iso", on: true }, { pattern: "*.bak", on: false }],
+  });
+  assert.deepEqual(lib.activeExcludes(s), [".git", ".svn", "target", "*.iso"]);
+  assert.deepEqual(lib.activeExcludes(lib.mergeSettings({})), []);
+  // Every template has a unique id and at least one pattern.
+  const ids = lib.EXCLUDE_PRESETS.map((p) => p.id);
+  assert.equal(new Set(ids).size, ids.length);
+  assert.ok(lib.EXCLUDE_PRESETS.every((p) => p.patterns.length > 0));
+});
+
+test("categorize folds extensions into categories", () => {
+  assert.equal(lib.categoryOf("MKV"), "video");
+  assert.equal(lib.categoryOf(""), "other");
+  const cats = lib.categorize([
+    { ext: "mkv", size: 100, count: 1 },
+    { ext: "jpg", size: 30, count: 3 },
+    { ext: "mp4", size: 200, count: 2 },
+    { ext: "weird", size: 5, count: 1 },
+  ]);
+  assert.deepEqual(cats.map((c) => [c.id, c.size, c.count]), [["video", 300, 3], ["image", 30, 3], ["other", 5, 1]]);
+  assert.deepEqual(cats[0].exts.map((e) => e.ext), ["mp4", "mkv"]);
+  assert.deepEqual(lib.categorize(undefined), []);
+});
+
+test("bucketLabel names open and closed ranges", () => {
+  const b = [{ upper: 4096 }, { upper: 65536 }, { upper: null }];
+  assert.equal(lib.bucketLabel(b, 0), "< 4 KB");
+  assert.equal(lib.bucketLabel(b, 1), "4 KB – 64 KB");
+  assert.equal(lib.bucketLabel(b, 2), "≥ 64 KB");
+});
+
+test("jobsToStart fills free slots oldest first", () => {
+  const jobs = [
+    { id: 1, state: "done" }, { id: 2, state: "running" },
+    { id: 3, state: "queued" }, { id: 4, state: "queued" }, { id: 5, state: "queued" },
+  ];
+  assert.deepEqual(lib.jobsToStart(jobs, 3).map((j) => j.id), [3, 4]);
+  assert.deepEqual(lib.jobsToStart(jobs, 1), []);
+  assert.deepEqual(lib.jobsToStart([], 2), []);
+});
+
+test("mapItems adds direct files and unlisted folders so areas add up", () => {
+  const items = lib.mapItems(100, [{ path: "/a", size: 60 }, { path: "/b", size: 0 }], 15);
+  assert.deepEqual(items.map((i) => [i.path, i.size, i.rest]), [
+    ["/a", 60, undefined], [null, 25, "other"], [null, 15, "files"],
+  ]);
+  assert.equal(items.reduce((a, i) => a + i.size, 0), 100);
+  assert.deepEqual(lib.mapItems(10, [{ path: "/a", size: 10 }], 0).length, 1);
+});
+
+test("parentPath walks up to the root and stops there", () => {
+  assert.equal(lib.parentPath("C:\\Users\\me"), "C:\\Users");
+  assert.equal(lib.parentPath("C:\\Users"), "C:\\");
+  assert.equal(lib.parentPath("C:\\"), null);
+  assert.equal(lib.parentPath("/home/me"), "/home");
+  assert.equal(lib.parentPath("/home"), "/");
+  assert.equal(lib.parentPath("/"), null);
+  assert.equal(lib.parentPath("\\\\srv\\share\\x"), "\\\\srv\\share");
+});
+
+test("isUnder respects separators and Windows case rules", () => {
+  assert.ok(lib.isUnder("C:\\Users\\me", "C:\\"));
+  assert.ok(lib.isUnder("c:\\users\\ME\\x", "C:\\Users\\me"));
+  assert.ok(lib.isUnder("C:\\Users", "C:\\Users\\"));
+  assert.ok(lib.isUnder("C:/Users/me", "C:\\Users"));
+  assert.ok(!lib.isUnder("C:\\Users2", "C:\\Users"));
+  assert.ok(!lib.isUnder("D:\\x", "C:\\"));
+  assert.ok(lib.isUnder("/home/me", "/"));
+  assert.ok(lib.isUnder("/home/me", "/home"));
+  assert.ok(!lib.isUnder("/home/Me", "/home/me"));
+  assert.ok(!lib.isUnder("/homer", "/home"));
+});

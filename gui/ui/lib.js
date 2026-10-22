@@ -136,5 +136,176 @@
     return { map, maxAbs };
   }
 
-  return { human, humanDelta, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath };
+  // `part` as a share of `whole`: "42%", "0.4%", "<0.1%"; "" if whole is 0.
+  function pct(part, whole) {
+    if (!whole) return "";
+    const p = (100 * part) / whole;
+    if (p > 0 && p < 0.1) return "<0.1%";
+    return p < 10 ? `${p.toFixed(1)}%` : `${Math.round(p)}%`;
+  }
+
+  // Exclude templates by ecosystem. A pattern matches a whole path, any path
+  // component or a file name (see the core's `Options::exclude`), so
+  // `node_modules` drops every such folder and `*.pyc` every such file.
+  const EXCLUDE_PRESETS = [
+    { id: "vcs", patterns: [".git", ".svn", ".hg"] },
+    { id: "node", patterns: ["node_modules", ".next", ".nuxt", ".svelte-kit", ".parcel-cache", ".turbo", "bower_components"] },
+    { id: "python", patterns: ["__pycache__", ".venv", "venv", ".tox", ".pytest_cache", ".mypy_cache", ".ruff_cache", "*.pyc"] },
+    { id: "rust", patterns: ["target"] },
+    { id: "jvm", patterns: [".gradle", "build", "out"] },
+    { id: "dotnet", patterns: ["bin", "obj", "packages"] },
+    { id: "vendor", patterns: ["vendor"] },
+    { id: "cpp", patterns: ["CMakeFiles", "cmake-build-*", "*.o", "*.obj", "*.pch", "*.ipch"] },
+    { id: "dart", patterns: [".dart_tool", ".pub-cache"] },
+    { id: "ide", patterns: [".idea", ".vs", ".vscode", "*.swp"] },
+    { id: "caches", patterns: [".cache", "Cache", "cache", "Code Cache", "GPUCache"] },
+    { id: "temp", patterns: ["Temp", "tmp", "*.tmp", "*.temp", "*.dmp"] },
+    { id: "logs", patterns: ["*.log"] },
+    { id: "winsys", patterns: ["$Recycle.Bin", "System Volume Information", "pagefile.sys", "hiberfil.sys", "swapfile.sys"] },
+    { id: "macos", patterns: [".DS_Store", ".Trash", ".Spotlight-V100", ".fseventsd"] },
+  ];
+
+  const DEFAULT_SETTINGS = {
+    top: 50, // folders / files listed per view
+    min_mb: 1, // duplicate search ignores smaller files
+    max_depth: null,
+    follow_symlinks: false,
+    trash: true, // delete -> Recycle Bin
+    parallel: 2, // scans running at once; the rest wait in the queue
+    presets: [], // enabled exclude template ids
+    preset_off: [], // "id:pattern" switched off inside an enabled template
+    custom: [], // [{ pattern, on }]
+    window_size: "auto",
+    language: "auto",
+  };
+
+  // Saved settings over the defaults: unknown keys are dropped, wrong types
+  // fall back, numbers are clamped — a hand-edited file can't break the UI.
+  function mergeSettings(saved) {
+    const s = { ...DEFAULT_SETTINGS, presets: [], preset_off: [], custom: [] };
+    if (!saved || typeof saved !== "object") return s;
+    const int = (v, lo, hi, dflt) => (Number.isInteger(v) ? Math.min(hi, Math.max(lo, v)) : dflt);
+    s.top = int(saved.top, 1, 1000, s.top);
+    s.min_mb = int(saved.min_mb, 0, 1_000_000, s.min_mb);
+    s.max_depth = saved.max_depth == null ? null : int(saved.max_depth, 1, 100, null);
+    s.parallel = int(saved.parallel, 1, 8, s.parallel);
+    if (typeof saved.follow_symlinks === "boolean") s.follow_symlinks = saved.follow_symlinks;
+    if (typeof saved.trash === "boolean") s.trash = saved.trash;
+    const ids = new Set(EXCLUDE_PRESETS.map((p) => p.id));
+    if (Array.isArray(saved.presets)) s.presets = saved.presets.filter((id) => ids.has(id));
+    if (Array.isArray(saved.preset_off)) s.preset_off = saved.preset_off.filter((k) => typeof k === "string");
+    if (Array.isArray(saved.custom)) {
+      s.custom = saved.custom
+        .filter((c) => c && typeof c.pattern === "string" && c.pattern.trim())
+        .map((c) => ({ pattern: c.pattern.trim(), on: c.on !== false }));
+    }
+    if (["auto", "maximized", "1080p", "1440p", "4k"].includes(saved.window_size)) s.window_size = saved.window_size;
+    if (["auto", "en", "de"].includes(saved.language)) s.language = saved.language;
+    return s;
+  }
+
+  // Every exclude pattern the settings switch on, once each, in a stable order.
+  function activeExcludes(s) {
+    const out = [];
+    const off = new Set(s.preset_off || []);
+    for (const p of EXCLUDE_PRESETS) {
+      if (!(s.presets || []).includes(p.id)) continue;
+      for (const pat of p.patterns) if (!off.has(`${p.id}:${pat}`)) out.push(pat);
+    }
+    for (const c of s.custom || []) if (c.on) out.push(c.pattern);
+    return [...new Set(out)];
+  }
+
+  // File extension -> category, for the "what is it made of" chart.
+  const CATEGORY_EXTS = {
+    video: "mp4 mkv avi mov wmv flv webm m4v mpg mpeg m2ts mts vob 3gp ts",
+    image: "jpg jpeg png gif bmp tif tiff webp heic heif avif raw cr2 cr3 nef arw dng psd xcf svg ico",
+    audio: "mp3 wav flac aac ogg oga m4a wma opus aiff aif mid midi",
+    archive: "zip rar 7z tar gz tgz bz2 xz zst lz4 cab",
+    diskimage: "iso img vhd vhdx vmdk vdi qcow2 dmg wim esd",
+    document: "pdf doc docx xls xlsx ppt pptx odt ods odp rtf txt md csv epub",
+    code: "js mjs cjs ts tsx jsx py rs go java kt c cc cpp h hpp cs php rb swift dart lua json xml yaml yml toml html htm css scss sql sh ps1 bat cmd vue map",
+    program: "exe dll sys msi msix so dylib lib a jar apk appx pdb node",
+    gamedata: "pak uasset ubulk utoc ucas vpk bsa ba2 unity3d assets resource bundle forge",
+    database: "db sqlite sqlite3 mdb accdb mdf ldf ndf",
+  };
+  const EXT_CATEGORY = new Map();
+  for (const [cat, list] of Object.entries(CATEGORY_EXTS)) {
+    for (const ext of list.split(" ")) EXT_CATEGORY.set(ext, cat);
+  }
+  function categoryOf(ext) {
+    return EXT_CATEGORY.get(String(ext).toLowerCase()) || "other";
+  }
+
+  // Fold per-extension stats into categories, largest first. Each category
+  // keeps its extensions (largest first) for the hover detail.
+  function categorize(extensions) {
+    const cats = new Map();
+    for (const e of extensions || []) {
+      const id = categoryOf(e.ext);
+      const c = cats.get(id) || { id, size: 0, count: 0, exts: [] };
+      c.size += e.size;
+      c.count += e.count;
+      c.exts.push(e);
+      cats.set(id, c);
+    }
+    const out = [...cats.values()];
+    for (const c of out) c.exts.sort((a, b) => b.size - a.size);
+    return out.sort((a, b) => b.size - a.size);
+  }
+
+  // "< 4 KB", "4 KB – 64 KB", "≥ 4 GB" for the size-distribution buckets.
+  function bucketLabel(buckets, i) {
+    const short = (b) => human(b).replace(".0 ", " ");
+    const lo = i > 0 ? buckets[i - 1].upper : null;
+    const hi = buckets[i].upper;
+    if (lo == null) return `< ${short(hi)}`;
+    if (hi == null) return `≥ ${short(lo)}`;
+    return `${short(lo)} – ${short(hi)}`;
+  }
+
+  // Which queued jobs may start now, oldest first, so that no more than
+  // `maxParallel` jobs run at once.
+  function jobsToStart(jobs, maxParallel) {
+    const running = jobs.filter((j) => j.state === "running").length;
+    const free = Math.max(0, maxParallel - running);
+    return jobs.filter((j) => j.state === "queued").slice(0, free);
+  }
+
+  // The tiles of one map level: real folders plus, so the areas add up to the
+  // folder's total, the files sitting directly in it and the folders that
+  // didn't make the list. Pseudo tiles carry `rest` and no path.
+  function mapItems(total, children, rootFilesSize) {
+    const items = children.filter((c) => c.size > 0).map((c) => ({ ...c }));
+    const listed = items.reduce((a, c) => a + c.size, 0);
+    if (rootFilesSize > 0) items.push({ path: null, size: rootFilesSize, rest: "files" });
+    const other = total - listed - (rootFilesSize || 0);
+    if (other > 0) items.push({ path: null, size: other, rest: "other" });
+    return items.sort((a, b) => b.size - a.size);
+  }
+
+  // The folder above `path`, or null at a root ("C:\", "/", a UNC share).
+  function parentPath(path) {
+    const parts = crumbs(path);
+    return parts.length > 1 ? parts[parts.length - 2].target : null;
+  }
+
+  // Whether `path` is `root` or lies below it. Windows paths compare
+  // case-insensitively and with either separator.
+  function isUnder(path, root) {
+    const win = /\\|^[A-Za-z]:/.test(String(path) + String(root));
+    const norm = (s) => {
+      let x = String(s);
+      if (win) x = x.replace(/\//g, "\\").toLowerCase();
+      return x.replace(/[\\/]+$/, "");
+    };
+    const p = norm(path), r = norm(root);
+    return p === r || p.startsWith(r + (win ? "\\" : "/"));
+  }
+
+  return {
+    human, humanDelta, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
+    pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
+    categorize, bucketLabel, jobsToStart, mapItems, parentPath, isUnder,
+  };
 });
