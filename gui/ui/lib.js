@@ -197,7 +197,7 @@
     // Before version 2 at most 2 scans ran at once; that default is gone.
     if (saved.version >= 2) s.parallel = int(saved.parallel, 1, 8, s.parallel);
     s.keep_snapshots = int(saved.keep_snapshots, 1, 100, s.keep_snapshots);
-    if (["fast", "gentle"].includes(saved.engine)) s.engine = saved.engine;
+    if (["fast", "gentle", "mft"].includes(saved.engine)) s.engine = saved.engine;
     if (typeof saved.follow_symlinks === "boolean") s.follow_symlinks = saved.follow_symlinks;
     if (typeof saved.trash === "boolean") s.trash = saved.trash;
     const ids = new Set(EXCLUDE_PRESETS.map((p) => p.id));
@@ -295,6 +295,15 @@
     return parts.slice(0, -1).some((p) => PROTECTED_DIRS.has(p.toLowerCase()));
   }
 
+  // The same protection as exclude patterns, so a duplicate search does not
+  // even read program and game files: their folders as path components,
+  // their file types as `*.ext`.
+  function protectedExcludes() {
+    const exts = new Set(PROTECTED_EXTS);
+    for (const [ext, cat] of EXT_CATEGORY) if (cat === "program" || cat === "gamedata") exts.add(ext);
+    return [...PROTECTED_DIRS, ...[...exts].sort().map((e) => `*.${e}`)];
+  }
+
   // Duplicate groups by the set of folders their copies sit in, so "these
   // two folders share 300 identical files" is one line instead of 300.
   function folderSets(groups) {
@@ -377,6 +386,6 @@
     human, humanDelta, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
     pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
     categorize, bucketLabel, jobsToStart, driveKey, mapItems, parentPath, isUnder, SETTINGS_VERSION,
-    isProtectedPath, folderSets,
+    isProtectedPath, folderSets, protectedExcludes,
   };
 });

@@ -19,6 +19,9 @@ use crate::{build_globset, is_excluded, on_disk_size, FileEntry, Options, Progre
 pub(crate) struct Batch {
     pub(crate) dir: PathBuf,
     pub(crate) files: Vec<FileEntry>,
+    /// Last-modified time of each of `files` (nanoseconds since the Unix
+    /// epoch, 0 if unknown) — from the same listing, so it costs nothing.
+    pub(crate) modified: Vec<u64>,
     /// Subdirectories (also those not descended into because of `max_depth`).
     pub(crate) subdirs: Vec<PathBuf>,
     /// Entries neither counted nor followed: symlinks and junctions when links
@@ -58,7 +61,40 @@ impl Ctx<'_> {
 /// Walk `root`, calling `sink` on the caller's thread with each directory's
 /// [`Batch`] as soon as it is listed (in no particular order). Honours
 /// exclusions, max depth, link following and cancellation.
-pub(crate) fn walk(root: &Path, opts: &Options, progress: &Progress, mut sink: impl FnMut(Batch)) {
+pub(crate) fn walk(
+    root: &Path,
+    opts: &Options,
+    progress: &Progress,
+    mut sink: impl FnMut(Batch),
+) -> (Engine, Option<String>) {
+    walk_dyn(root, opts, progress, &mut sink)
+}
+
+/// [`walk`] with a type-erased sink, so the MFT engine can hand folders it
+/// cannot read itself back to the directory walk.
+pub(crate) fn walk_dyn(
+    root: &Path,
+    opts: &Options,
+    progress: &Progress,
+    sink: &mut dyn FnMut(Batch),
+) -> (Engine, Option<String>) {
+    // Why the MFT was asked for but not used.
+    let mut fallback = None;
+    if opts.mft {
+        #[cfg(windows)]
+        if opts.follow_symlinks {
+            fallback = Some("links are followed only by the directory walk".to_string());
+        } else {
+            match crate::mft::walk(root, opts, progress, sink) {
+                Ok(()) => return (Engine::Mft, None),
+                Err(e) => fallback = Some(e.to_string()),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            fallback = Some("the MFT engine exists on Windows only".to_string());
+        }
+    }
     let threads = opts.threads.unwrap_or_else(default_threads).max(1);
     let (tx, rx) = mpsc::channel();
     let ctx = Ctx {
@@ -90,6 +126,17 @@ pub(crate) fn walk(root: &Path, opts: &Options, progress: &Progress, mut sink: i
             sink(batch);
         }
     });
+    (Engine::Walk, fallback)
+}
+
+/// How a tree was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// Directory by directory.
+    Walk,
+    /// From the NTFS Master File Table (Windows only).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Mft,
 }
 
 fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth: usize) {
@@ -99,6 +146,7 @@ fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth
     let mut b = Batch {
         dir,
         files: Vec::new(),
+        modified: Vec::new(),
         subdirs: Vec::new(),
         others: Vec::new(),
         skipped: 0,
@@ -170,6 +218,7 @@ fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth
             };
             let size = on_disk_size(&meta, &path);
             bytes += size;
+            b.modified.push(modified_ns(&meta));
             b.files.push(FileEntry {
                 path,
                 size,
@@ -184,4 +233,12 @@ fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth
         .fetch_add(b.files.len() as u64, Ordering::Relaxed);
     ctx.progress.bytes.fetch_add(bytes, Ordering::Relaxed);
     let _ = ctx.tx.send(b);
+}
+
+/// Modification time in nanoseconds since the Unix epoch (0 if unknown).
+pub(crate) fn modified_ns(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }

@@ -15,7 +15,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
-use crate::walk::{walk, Batch};
+use crate::walk::{walk, Batch, Engine};
 use crate::{
     disk_space, DirSize, ExtStat, FileEntry, FileStats, Options, Progress, ScanReport, SizeBucket,
     SIZE_BUCKET_BOUNDS,
@@ -62,6 +62,9 @@ pub struct ScanTree {
     exts: Vec<Box<str>>,
     skipped: u64,
     cancelled: bool,
+    engine: Engine,
+    /// Why the MFT was asked for but the directory walk ran.
+    mft_fallback: Option<String>,
     disk_total: u64,
     disk_free: u64,
 }
@@ -199,6 +202,131 @@ impl Builder {
     }
 }
 
+#[cfg(windows)]
+impl Builder {
+    /// Build the tree straight from the NTFS Master File Table — no path is
+    /// made except for cloud placeholders, which are sized (files) or listed
+    /// (folders) the ordinary way, through the cloud filter.
+    fn add_mft(
+        &mut self,
+        table: &crate::mft::Table,
+        opts: &Options,
+        progress: &Progress,
+    ) -> Result<(), crate::mft::MftError> {
+        use std::sync::atomic::Ordering;
+        let start = table.find(&self.tree.root)?;
+        let mut queue = vec![(start, 0usize, 0usize)]; // (record, node, depth)
+        let mut cloud = Vec::new();
+        if table.is_cloud(start) {
+            // The folder itself is synced: all of it through Windows.
+            queue.clear();
+            cloud.push((0usize, 0usize));
+        }
+        while let Some((dir, id, depth)) = queue.pop() {
+            if progress.cancelled() {
+                break;
+            }
+            let child_depth = depth + 1;
+            if opts.max_depth.is_some_and(|m| child_depth > m) {
+                continue;
+            }
+            let descend = opts.max_depth.map_or(true, |m| child_depth < m);
+            let (mut size, mut count) = (0u64, 0u64);
+            for e in table.children(dir) {
+                if e.is_dir {
+                    let child = self.push(id, e.name);
+                    if descend {
+                        if e.cloud {
+                            cloud.push((child, child_depth));
+                        } else {
+                            queue.push((e.record, child, child_depth));
+                        }
+                    }
+                } else {
+                    let mut bytes = e.size;
+                    if e.cloud {
+                        let path = self.tree.path_of(id).join(e.name);
+                        bytes = crate::compressed_size(&path).unwrap_or(bytes);
+                    }
+                    let ext = self.ext_id(e.name);
+                    self.tree.nodes[id].files.push(FileRec {
+                        name: e.name.as_os_str().into(),
+                        size: bytes,
+                        logical_size: e.logical,
+                        ext,
+                    });
+                    size += bytes;
+                    count += 1;
+                }
+            }
+            let node = &mut self.tree.nodes[id];
+            node.size += size;
+            node.file_count += count;
+            progress.files.fetch_add(count, Ordering::Relaxed);
+            progress.bytes.fetch_add(size, Ordering::Relaxed);
+        }
+        // Cloud folders, listed the ordinary way into this same tree.
+        for (id, depth) in cloud {
+            if progress.cancelled() {
+                break;
+            }
+            let local = Options {
+                mft: false,
+                max_depth: opts.max_depth.map(|m| m.saturating_sub(depth)),
+                ..opts.clone()
+            };
+            if local.max_depth == Some(0) {
+                continue;
+            }
+            let path = self.tree.path_of(id);
+            self.pending.insert(path.clone(), id);
+            let _ = walk(&path, &local, progress, |b| self.add(b));
+        }
+        Ok(())
+    }
+}
+
+/// Fill `b` from the MFT if asked and possible (no exclusions: those need
+/// paths), else from the directory walk. Returns the engine used and, if the
+/// MFT was asked for but not used, why.
+#[cfg(windows)]
+fn fill(
+    b: &mut Builder,
+    root: &Path,
+    opts: &Options,
+    progress: &Progress,
+) -> (Engine, Option<String>) {
+    if opts.mft && opts.exclude.is_empty() && !opts.follow_symlinks {
+        let direct = crate::mft::Table::read(root, progress).and_then(|mut table| {
+            b.add_mft(&table, opts, progress)?;
+            table.mark("build tree");
+            Ok(())
+        });
+        return match direct {
+            Ok(()) => (Engine::Mft, None),
+            Err(e) => {
+                let walk_opts = Options {
+                    mft: false,
+                    ..opts.clone()
+                };
+                let (engine, _) = walk(root, &walk_opts, progress, |batch| b.add(batch));
+                (engine, Some(e.to_string()))
+            }
+        };
+    }
+    walk(root, opts, progress, |batch| b.add(batch))
+}
+
+#[cfg(not(windows))]
+fn fill(
+    b: &mut Builder,
+    root: &Path,
+    opts: &Options,
+    progress: &Progress,
+) -> (Engine, Option<String>) {
+    walk(root, opts, progress, |batch| b.add(batch))
+}
+
 impl Node {
     fn new(name: &OsStr, parent: Option<usize>) -> Node {
         Node {
@@ -224,14 +352,26 @@ impl ScanTree {
                 exts: Vec::new(),
                 skipped: 0,
                 cancelled: false,
+                engine: Engine::Walk,
+                mft_fallback: None,
                 disk_total: 0,
                 disk_free: 0,
             },
             pending: HashMap::new(),
             ext_ids: HashMap::new(),
         };
-        walk(root, opts, progress, |batch| b.add(batch));
-        b.finish(progress.cancelled())
+        let (engine, fallback) = fill(&mut b, root, opts, progress);
+        b.tree.engine = engine;
+        b.tree.mft_fallback = fallback;
+        let started = std::time::Instant::now();
+        let tree = b.finish(progress.cancelled());
+        if std::env::var_os("DISKGHOST_TRACE").is_some() {
+            eprintln!(
+                "tree: finish {:.0} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        tree
     }
 
     /// The directory this tree was built from.
@@ -279,6 +419,20 @@ impl ScanTree {
     /// True if the walk was cancelled; the tree then covers only what was seen.
     pub fn cancelled(&self) -> bool {
         self.cancelled
+    }
+
+    /// How the tree was read: `"mft"` (NTFS Master File Table) or `"walk"`.
+    pub fn engine(&self) -> &'static str {
+        match self.engine {
+            Engine::Mft => "mft",
+            Engine::Walk => "walk",
+        }
+    }
+
+    /// Why the MFT engine was requested but not used (e.g. no administrator
+    /// rights), if so.
+    pub fn mft_fallback(&self) -> Option<&str> {
+        self.mft_fallback.as_deref()
     }
 
     /// Re-query the filesystem's total/free bytes (e.g. after deleting files).
@@ -719,6 +873,7 @@ mod tests {
                     logical_size: size,
                 })
                 .collect(),
+            modified: vec![0; files.len()],
             subdirs: subdirs.iter().map(PathBuf::from).collect(),
             others: Vec::new(),
             skipped: 0,
@@ -730,6 +885,8 @@ mod tests {
                 exts: Vec::new(),
                 skipped: 0,
                 cancelled: false,
+                engine: Engine::Walk,
+                mft_fallback: None,
                 disk_total: 0,
                 disk_free: 0,
             },
