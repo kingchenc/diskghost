@@ -614,7 +614,7 @@ impl ScanTree {
                 }
             }
         }
-        let mut top: Vec<(u64, usize, usize)> = heap.into_iter().map(|Reverse(x)| x).collect();
+        let top: Vec<(u64, usize, usize)> = heap.into_iter().map(|Reverse(x)| x).collect();
         let mut top_files: Vec<FileEntry> = top
             .into_iter()
             .map(|(_, i, j)| {
