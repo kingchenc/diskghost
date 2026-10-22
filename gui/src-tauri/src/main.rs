@@ -222,7 +222,7 @@ fn snapshot_files(dir: &Path) -> Vec<(u64, PathBuf)> {
             Some((path.file_stem()?.to_str()?.parse().ok()?, path))
         })
         .collect();
-    out.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    out.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
     out
 }
 
