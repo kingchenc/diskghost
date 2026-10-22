@@ -482,9 +482,8 @@ fn read_table(
                     }
                 }
             }
-            progress
-                .files
-                .fetch_add(out.len() as u64, Ordering::Relaxed);
+            // Records are not files: progress counts files once the tree is
+            // built from them.
             Ok(out)
         })
         .collect::<Result<_, std::io::Error>>()?;

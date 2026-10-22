@@ -103,6 +103,12 @@ impl Progress {
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes.load(Ordering::Relaxed)
     }
+    /// Set the counters from outside — for an operation that runs in another
+    /// process and reports its progress back (the elevated MFT helper).
+    pub fn set_counts(&self, files: u64, bytes: u64) {
+        self.files.store(files, Ordering::Relaxed);
+        self.bytes.store(bytes, Ordering::Relaxed);
+    }
     /// Start a new phase: counters restart at 0 against the given totals.
     fn enter(&self, phase: u64, total_files: u64, total_bytes: u64) {
         self.files.store(0, Ordering::Relaxed);

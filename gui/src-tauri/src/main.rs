@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, LogicalSize, Manager};
 use tauri_plugin_dialog::DialogExt;
 
+mod helper;
+
 /// Sub-folders shown inside each folder on the map's second level.
 const NESTED_PER_FOLDER: usize = 12;
 
@@ -54,6 +56,8 @@ struct AppState {
     /// File hashes of earlier duplicate searches (loaded on first use, saved
     /// after each search), so searching again only reads changed files.
     hashes: Mutex<Option<Arc<HashCache>>>,
+    /// The elevated MFT helper, once started.
+    helper: Mutex<Option<Arc<helper::Helper>>>,
 }
 
 /// Payload pushed to the frontend as a scan/search runs.
@@ -82,7 +86,7 @@ impl ProgressPayload {
 }
 
 /// Walk options coming from the frontend.
-#[derive(Deserialize, Default, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 #[serde(default)]
 struct WalkOpts {
     exclude: Vec<String>,
@@ -287,7 +291,7 @@ async fn scan_dir(
         if !requested.is_dir() {
             return Err(format!("not a directory: {path}"));
         }
-        let tree = ScanTree::build(&requested, &opts.to_options(), &running.progress);
+        let (tree, snap) = build_tree(&app, job, &requested, &opts, &running.progress);
         drop(running);
         let view = view_of(&tree, tree.root(), top).ok_or("scan produced no tree")?;
         let complete = !tree.cancelled();
@@ -295,7 +299,7 @@ async fn scan_dir(
         let shared: Shared = Arc::new(RwLock::new(Cached {
             tree,
             views: HashMap::new(),
-            current: Mutex::new(None),
+            current: Mutex::new(snap.map(Arc::new)),
         }));
         if let Ok(mut trees) = app.state::<AppState>().trees.lock() {
             trees.insert(job, shared.clone());
@@ -317,6 +321,52 @@ async fn scan_dir(
         Ok(view)
     })
     .await
+}
+
+/// Walk `path`. The MFT engine needs administrator rights, which this window
+/// never has (Windows would block drag & drop into it): unless the app was
+/// started elevated anyway, the scan runs in the elevated helper, which also
+/// hands back the snapshot it made. Any problem there falls back to the
+/// directory walk, with the reason recorded on the tree.
+fn build_tree(
+    app: &tauri::AppHandle,
+    job: u64,
+    path: &Path,
+    opts: &WalkOpts,
+    progress: &Progress,
+) -> (ScanTree, Option<Snapshot>) {
+    if !opts.mft || is_elevated() {
+        return (ScanTree::build(path, &opts.to_options(), progress), None);
+    }
+    match mft_helper(app).and_then(|h| h.scan(job, path, opts, progress)) {
+        Ok((tree, snap, _)) => (tree, Some(snap)),
+        Err(why) => {
+            let walk_opts = Options {
+                mft: false,
+                ..opts.to_options()
+            };
+            let mut tree = ScanTree::build(path, &walk_opts, progress);
+            tree.set_engine(false, Some(why));
+            (tree, None)
+        }
+    }
+}
+
+/// The running elevated helper, started (with the user's consent) on first use.
+fn mft_helper(app: &tauri::AppHandle) -> Result<Arc<helper::Helper>, String> {
+    let state = app.state::<AppState>();
+    let mut slot = state.helper.lock().map_err(|e| e.to_string())?;
+    if let Some(h) = slot.as_ref().filter(|h| h.alive()) {
+        return Ok(h.clone());
+    }
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("mft-helper");
+    let h = Arc::new(helper::Helper::start(dir)?);
+    *slot = Some(h.clone());
+    Ok(h)
 }
 
 /// The view of `path` inside job `job`'s tree — never walks the disk.
@@ -655,52 +705,6 @@ fn is_elevated() -> bool {
     }
 }
 
-/// Start the app again with administrator rights (Windows asks for consent)
-/// and quit this instance. An error if the user declined.
-#[tauri::command]
-fn restart_elevated(app: tauri::AppHandle) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        #[link(name = "shell32")]
-        extern "system" {
-            fn ShellExecuteW(
-                hwnd: *mut std::ffi::c_void,
-                op: *const u16,
-                file: *const u16,
-                params: *const u16,
-                dir: *const u16,
-                show: i32,
-            ) -> isize;
-        }
-        let wide = |s: &std::ffi::OsStr| -> Vec<u16> {
-            s.encode_wide().chain(std::iter::once(0)).collect()
-        };
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let (op, file) = (wide("runas".as_ref()), wide(exe.as_os_str()));
-        let r = unsafe {
-            ShellExecuteW(
-                std::ptr::null_mut(),
-                op.as_ptr(),
-                file.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1, // SW_SHOWNORMAL
-            )
-        };
-        if r <= 32 {
-            return Err("administrator rights were not granted".into());
-        }
-        app.exit(0);
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = app;
-        Err("only available on Windows".into())
-    }
-}
-
 /// The app's version, for the title bar.
 #[tauri::command]
 fn app_version() -> &'static str {
@@ -920,6 +924,12 @@ fn place_window(app: &tauri::AppHandle) {
 }
 
 fn main() {
+    // The same executable doubles as the elevated MFT helper (no window).
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 4 && args[1] == "--mft-helper" {
+        helper::serve(Path::new(&args[2]), &args[3]);
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -927,6 +937,7 @@ fn main() {
                 jobs: Mutex::new(HashMap::new()),
                 trees: Mutex::new(HashMap::new()),
                 hashes: Mutex::new(None),
+                helper: Mutex::new(None),
             });
             place_window(app.handle());
             Ok(())
@@ -948,8 +959,7 @@ fn main() {
             load_settings,
             save_settings,
             app_version,
-            is_elevated,
-            restart_elevated
+            is_elevated
         ])
         .run(tauri::generate_context!())
         .expect("error while running Diskghost");

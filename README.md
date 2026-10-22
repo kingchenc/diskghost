@@ -143,7 +143,10 @@ A modern Tauri UI lives in `gui/`:
   your own; patterns are validated before they are used.
 - **Settings** — scan engine (**Fast** for SSD/NVMe: many directories at once;
   **Gentle** for spinning disks, network drives or scanning in the background;
-  **Ultra** = the NTFS MFT engine, with a *restart as administrator* button),
+  **Ultra** = the NTFS MFT engine: the window itself never runs elevated —
+  so dragging folders in keeps working — and on the first Ultra scan Windows
+  asks once for a hidden helper that reads the drives and hands each scan back
+  as a snapshot),
   list length, max depth, symlinks, parallel scans, snapshots kept per folder,
   duplicate minimum size, Recycle Bin vs. permanent delete, window size at start
   (1440p if it fits the screen, otherwise maximized; or 1080p / 4K / maximized),

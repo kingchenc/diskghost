@@ -107,8 +107,11 @@ const I18N = {
     setDelete: "Deleting", setTrash: "Send deleted items to the Recycle Bin", setTrashD: "Off deletes permanently.",
     engineMft: "Ultra — NTFS MFT (administrator)",
     engineMftD: "Reads the drive's file table (MFT) in one go instead of opening every folder, also for the duplicate search. Pays off most on the system drive C:, where Windows slows folder listing down (measured: 5× faster). On a SATA SSD with millions of files the table is larger than the folders and Fast can be quicker. Needs administrator rights and a local NTFS drive, otherwise Fast is used automatically. OneDrive folders are always read through Windows; links are not followed.",
-    mftNeedsAdmin: "Diskghost is not running as administrator.", restartAdmin: "Restart as administrator",
-    adminDropNote: "Windows does not allow dragging folders from Explorer onto a program running as administrator — use Browse or the drive list there.",
+    mftHelperTitle: "One confirmation per session",
+    mftHelperText: "Reading the file table needs administrator rights. On the first Ultra scan Windows asks once; a hidden helper then reads the drives. This window itself never runs as administrator, so dragging folders in keeps working.",
+    dropBlocked: "Diskghost was started as administrator, and Windows does not let Explorer drop folders into such a window. Paste a path above, use Browse… or click a drive.",
+    placeholderAdmin: "Paste a folder path or use Browse…",
+    welcomeTextAdmin: "Paste a folder path above, pick a drive below or use Browse. (Started as administrator: Windows blocks dragging folders in — not needed for Ultra, which asks for the rights itself.) Every scan gets its own entry on the left.",
     adminBadge: "Admin", mftFallback: "MFT not used",
     phaseWalk: "Listing files", phaseWalkD: "Finding files of the same size…",
     phaseSample: "Comparing start and end", phaseSampleD: "each file is opened once",
@@ -210,8 +213,11 @@ const I18N = {
     setDelete: "Löschen", setTrash: "Gelöschtes in den Papierkorb", setTrashD: "Aus löscht endgültig.",
     engineMft: "Ultra — NTFS MFT (Administrator)",
     engineMftD: "Liest die Dateitabelle (MFT) des Laufwerks am Stück, statt jeden Ordner zu öffnen, auch für die Duplikatsuche. Bringt am meisten auf dem Systemlaufwerk C:, wo Windows das Auflisten bremst (gemessen: 5× schneller). Auf einer SATA-SSD mit Millionen Dateien ist die Tabelle größer als die Ordner, dort kann „Schnell“ schneller sein. Braucht Administratorrechte und ein lokales NTFS-Laufwerk, sonst wird automatisch „Schnell“ benutzt. OneDrive-Ordner werden immer über Windows gelesen; Links werden nicht verfolgt.",
-    mftNeedsAdmin: "Diskghost läuft nicht als Administrator.", restartAdmin: "Als Administrator neu starten",
-    adminDropNote: "Windows erlaubt kein Ziehen von Ordnern aus dem Explorer auf ein Programm mit Administratorrechten — dort Durchsuchen oder die Laufwerksliste nutzen.",
+    mftHelperTitle: "Eine Bestätigung pro Sitzung",
+    mftHelperText: "Das Lesen der Dateitabelle braucht Administratorrechte. Beim ersten Ultra-Scan fragt Windows einmal nach; danach liest ein unsichtbarer Helfer die Laufwerke. Dieses Fenster selbst läuft nie als Administrator, Ordner reinziehen funktioniert also weiter.",
+    dropBlocked: "Diskghost wurde als Administrator gestartet, und Windows lässt den Explorer keine Ordner in so ein Fenster ziehen. Pfad oben einfügen, Durchsuchen… nutzen oder ein Laufwerk anklicken.",
+    placeholderAdmin: "Ordnerpfad einfügen oder Durchsuchen…",
+    welcomeTextAdmin: "Ordnerpfad oben einfügen, unten ein Laufwerk wählen oder Durchsuchen nutzen. (Als Administrator gestartet: Windows blockiert das Reinziehen von Ordnern — für Ultra unnötig, das fragt selbst nach den Rechten.) Jeder Scan bekommt links einen eigenen Eintrag.",
     adminBadge: "Admin", mftFallback: "MFT nicht benutzt",
     phaseWalk: "Dateien auflisten", phaseWalkD: "Suche Dateien gleicher Größe…",
     phaseSample: "Anfang und Ende vergleichen", phaseSampleD: "jede Datei wird einmal geöffnet",
@@ -237,11 +243,20 @@ const lang = () => {
 const t = (k) => I18N[lang()][k] ?? I18N.en[k] ?? k;
 const num = (n) => Number(n || 0).toLocaleString(lang() === "de" ? "de-DE" : "en-US");
 
+// Started as administrator: Explorer cannot drop into this window, so the
+// UI stops inviting it and points at what works instead.
+function adaptToElevation() {
+  if (!elevated) return;
+  document.querySelector(".side-sec .hint").textContent = t("dropBlocked");
+  $("path").placeholder = t("placeholderAdmin");
+}
+
 function applyI18n() {
   document.documentElement.lang = lang();
   document.querySelectorAll("[data-i18n]").forEach((e) => (e.textContent = t(e.dataset.i18n)));
   document.querySelectorAll("[data-i18n-ph]").forEach((e) => (e.placeholder = t(e.dataset.i18nPh)));
   document.querySelectorAll("[data-i18n-title]").forEach((e) => (e.title = t(e.dataset.i18nTitle)));
+  adaptToElevation();
 }
 
 // ---------------------------- safe DOM builder ----------------------------
@@ -450,9 +465,8 @@ function renderSettings() {
             (v) => set({ engine: v }, true))),
         settings.engine === "mft" && !elevated
           ? el("div", { class: "field" },
-            el("span", { class: "fl", text: t("mftNeedsAdmin") }),
-            el("button", { type: "button", class: "primary", onclick: () => invoke("restart_elevated").catch((e) => status(errText(e), true)) }, `🛡 ${t("restartAdmin")}`),
-            el("span", { class: "fd", text: t("adminDropNote") }))
+            el("span", { class: "fl", text: `🛡 ${t("mftHelperTitle")}` }),
+            el("span", { class: "fd", text: t("mftHelperText") }))
           : null,
         field(t("setKeep"), t("setKeepD"), numberInput(settings.keep_snapshots, 1, 100, (v) => set({ keep_snapshots: v ?? 10 }))))),
     el("section", { class: "set-sec" },
@@ -836,7 +850,7 @@ function welcomeView() {
     el("div", { class: "hero" },
       el("div", { class: "big", text: "👻" }),
       el("h1", { text: t("welcomeTitle") }),
-      el("p", { text: t("welcomeText") })),
+      el("p", { text: t(elevated ? "welcomeTextAdmin" : "welcomeText") })),
     drives.length ? el("div", { class: "drive-grid" }, drives.map(driveButton)) : null));
 }
 
@@ -1796,6 +1810,8 @@ try {
   Promise.all([invoke("app_version").catch(() => ""), invoke("is_elevated").catch(() => false)]).then(([v, admin]) => {
     elevated = Boolean(admin);
     $("version").textContent = `${v ? `v${v}` : ""}${elevated ? ` · ${t("adminBadge")}` : ""}`;
+    adaptToElevation();
+    if (!active()) renderMain();
   });
   try { settings = mergeSettings(await invoke("load_settings")); } catch (_) { /* defaults */ }
   applyI18n();

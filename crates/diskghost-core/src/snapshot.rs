@@ -461,6 +461,23 @@ impl Snapshot {
         hex[..16].to_string()
     }
 
+    /// Rebuild the scanned tree from a snapshot that records files (format
+    /// 2): the same folders, files and sizes, browsable like a fresh scan.
+    /// Logical sizes are not recorded, so they equal the on-disk sizes.
+    pub fn to_tree(&self) -> Result<ScanTree, SnapshotError> {
+        if !self.has_files {
+            return Err(SnapshotError::Corrupt("snapshot has no files".into()));
+        }
+        let mut entries = Vec::with_capacity(self.entries as usize);
+        let mut c = Cursor::new(self)?;
+        c.advance()?;
+        while !c.done {
+            entries.push((c.key.clone(), c.dir, c.size));
+            c.advance()?;
+        }
+        Ok(ScanTree::from_entries(&self.root, entries))
+    }
+
     /// Every directory below the root with its totals, in path order.
     pub fn dirs(&self) -> Result<Vec<DirSize>, SnapshotError> {
         let mut out = Vec::new();
@@ -1161,6 +1178,44 @@ mod tests {
         // Without files on the old side, no file is claimed as new.
         assert!(!r.files_compared);
         assert_eq!(r.new_files_count, 0);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_snapshot_rebuilds_the_same_tree() {
+        let d = tmpdir("totree");
+        write(&d.join("a/x.TXT"), &[0u8; 100]);
+        write(&d.join("a/b/y.bin"), &[0u8; 50_000]);
+        write(&d.join("a b/z"), &[0u8; 10]);
+        write(&d.join("top.mkv"), &[0u8; 20_000]);
+        std::fs::create_dir_all(d.join("empty")).unwrap();
+        let tree = ScanTree::build(&d, &Options::default(), &Progress::default());
+        let back = Snapshot::capture(&tree).to_tree().unwrap();
+
+        let (r1, r2) = (tree.root_report(10), back.root_report(10));
+        assert_eq!(r2.total_size, r1.total_size);
+        assert_eq!(r2.total_files, r1.total_files);
+        assert_eq!(r2.total_dirs, r1.total_dirs);
+        assert_eq!(r2.children, r1.children);
+        assert_eq!(r2.root_files_size, r1.root_files_size);
+        let paths = |r: &crate::ScanReport| {
+            r.top_files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&r2), paths(&r1));
+        assert_eq!(back.file_stats(&d), tree.file_stats(&d));
+        assert_eq!(
+            back.report(&d.join("a").join("b"), 5).unwrap().total_files,
+            1
+        );
+        assert!(back.contains(&d.join("empty")));
+
+        // Folder-only (format 1) snapshots cannot become a tree.
+        let mut old = Snapshot::capture(&tree);
+        old.has_files = false;
+        assert!(old.to_tree().is_err());
         std::fs::remove_dir_all(&d).ok();
     }
 

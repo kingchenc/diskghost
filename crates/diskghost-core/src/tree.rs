@@ -374,6 +374,54 @@ impl ScanTree {
         tree
     }
 
+    /// A tree from snapshot entries: (key, is directory, size) in snapshot
+    /// order, where a folder comes before everything inside it. Keys are
+    /// paths relative to `root` with `/` between components.
+    pub(crate) fn from_entries(root: &Path, entries: Vec<(Vec<u8>, bool, u64)>) -> ScanTree {
+        let mut b = Builder {
+            tree: ScanTree {
+                root: root.to_path_buf(),
+                nodes: vec![Node::new(OsStr::new(""), None)],
+                exts: Vec::new(),
+                skipped: 0,
+                cancelled: false,
+                engine: Engine::Walk,
+                mft_fallback: None,
+                disk_total: 0,
+                disk_free: 0,
+            },
+            pending: HashMap::new(),
+            ext_ids: HashMap::new(),
+        };
+        // Node ids of the folders on the path to the current entry.
+        let mut stack: Vec<usize> = vec![0];
+        for (key, is_dir, size) in entries {
+            let depth = key.iter().filter(|&&c| c == b'/').count() + 1;
+            let name_bytes = key.rsplit(|&c| c == b'/').next().unwrap_or(&[]);
+            let name = std::ffi::OsString::from(String::from_utf8_lossy(name_bytes).into_owned());
+            stack.truncate(depth);
+            let Some(&parent) = stack.last() else {
+                continue;
+            };
+            if is_dir {
+                let id = b.push(parent, &name);
+                stack.push(id);
+            } else {
+                let ext = b.ext_id(&name);
+                let node = &mut b.tree.nodes[parent];
+                node.size += size;
+                node.file_count += 1;
+                node.files.push(FileRec {
+                    name: name.into_boxed_os_str(),
+                    size,
+                    logical_size: size,
+                    ext,
+                });
+            }
+        }
+        b.finish(false)
+    }
+
     /// The directory this tree was built from.
     pub fn root(&self) -> &Path {
         &self.root
@@ -427,6 +475,19 @@ impl ScanTree {
             Engine::Mft => "mft",
             Engine::Walk => "walk",
         }
+    }
+
+    /// Record how a tree rebuilt elsewhere was read — for one that came from
+    /// another process (`mft`: read from the Master File Table; `fallback`:
+    /// why not, if it was asked for).
+    pub fn set_engine(&mut self, mft: bool, fallback: Option<String>) {
+        self.engine = if mft { Engine::Mft } else { Engine::Walk };
+        self.mft_fallback = fallback;
+    }
+
+    /// Flag a tree rebuilt elsewhere as the result of a cancelled walk.
+    pub fn mark_cancelled(&mut self) {
+        self.cancelled = true;
     }
 
     /// Why the MFT engine was requested but not used (e.g. no administrator
@@ -553,9 +614,8 @@ impl ScanTree {
                 }
             }
         }
-        let mut top: Vec<(u64, usize, usize)> = heap.into_iter().map(|Reverse(x)| x).collect();
-        top.sort_by_key(|x| Reverse(x.0));
-        let top_files = top
+        let top: Vec<(u64, usize, usize)> = heap.into_iter().map(|Reverse(x)| x).collect();
+        let mut top_files: Vec<FileEntry> = top
             .into_iter()
             .map(|(_, i, j)| {
                 let f = &self.nodes[i].files[j];
@@ -566,6 +626,8 @@ impl ScanTree {
                 }
             })
             .collect();
+        // Biggest first; equal sizes by path, so the list never reshuffles.
+        top_files.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
 
         ScanReport {
             root: base,
