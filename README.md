@@ -7,10 +7,12 @@ Find where your space went, hunt down byte-identical duplicates, and reclaim the
 
 ## Features
 
-- **Parallel scan** (`jwalk` + `rayon`) — total size, biggest sub-folders and
-  biggest files, files-directly-in-root, and a count of unreadable/skipped
-  entries. Also reports the drive's **free / total space** and how long the
-  scan took.
+- **Parallel scan** — total size, biggest sub-folders and biggest files,
+  files-directly-in-root, and a count of unreadable/skipped entries. Also
+  reports the drive's **free / total space** and how long the scan took. Sizes
+  come straight from the directory listing (no file is opened), every scan has
+  its own thread pool, and the tree is built while the walk is still running:
+  4.9 M files / 1.2 TB on an NVMe SSD in about 6 s.
 - **Correct duplicate detection** — group by size → **collapse hard links**
   (same physical file, so `wasted` is real) → **first-block pre-hash** → full
   **BLAKE3** hash, all in parallel.
@@ -20,7 +22,7 @@ Find where your space went, hunt down byte-identical duplicates, and reclaim the
   trash. Parallel unlink for speed, never follows symlinks (can't escape the
   target), refuses a drive root, dry-run by default, reports how long it took.
 - **Scan options** — exclude globs (`node_modules`, `*.tmp`), max depth,
-  follow-symlinks.
+  follow-symlinks, `--threads` (2-4 suit a spinning disk).
 - **Live progress + cancel** — long scans report files/bytes and can be stopped;
   a cancelled scan is clearly labelled as a partial result.
 - **One walk, whole tree** — the scan builds an in-memory tree, so the GUI
@@ -28,8 +30,11 @@ Find where your space went, hunt down byte-identical duplicates, and reclaim the
   again. Deleting from the GUI updates the tree in place.
 - **What grew since last time** — save a scan as a snapshot and compare a
   later one against it: which folders grew or shrank, which are new, which are
-  gone. Every directory is recorded (not just the biggest), so the comparison
-  works at any depth. The GUI keeps a history per scanned folder automatically.
+  gone, and **every file** that appeared, disappeared or changed size. Every
+  folder and file is recorded, sorted, front-coded and zstd-compressed (about
+  8 bytes per file: 42 MB for 4.9 M files), and two snapshots are compared in a
+  single streaming pass. The GUI keeps a history per scanned folder
+  automatically.
 - **Three faces, one Rust core**:
   - a **CLI** with `--json` output for scripts and agents (headless);
   - a **modern desktop GUI** (Tauri) with a dashboard per scan, several scans
@@ -72,16 +77,18 @@ diskghost rm "D:\old_project\target" --trash --apply   # send to the OS recycle 
 #   never follows symlinks (can't escape the target); refuses a drive root
 
 # What grew since last time: save a snapshot, compare against it later
-diskghost scan "C:\Users\me" --save before.json
-diskghost scan "C:\Users\me" --since before.json          # scan + what grew/shrank/appeared/vanished
-diskghost scan "C:\Users\me" --since before.json --save after.json
-diskghost diff before.json after.json                      # compare two saved snapshots
-diskghost diff before.json after.json --at "C:\Users\me\Downloads"   # ...at a sub-folder
+diskghost scan "C:\Users\me" --save before.dgs
+diskghost scan "C:\Users\me" --since before.dgs          # scan + what grew/shrank/appeared/vanished, file by file
+diskghost scan "C:\Users\me" --since before.dgs --save after.dgs
+diskghost diff before.dgs after.dgs                      # compare two saved snapshots
+diskghost diff before.dgs after.dgs --at "C:\Users\me\Downloads"   # ...at a sub-folder
 ```
 
-Snapshots are plain JSON, so a scheduled task (cron, Task Scheduler) that runs
-`diskghost scan <dir> --since last.json --save last.json --json` gives you a
-daily "what grew" report with nothing else to set up.
+A scheduled task (cron, Task Scheduler) that runs
+`diskghost scan <dir> --since last.dgs --save last.dgs --json` gives you a
+daily "what grew" report with nothing else to set up. Snapshots saved by
+0.8 and earlier (JSON, folders only) are still read; against those, only
+folder changes can be reported.
 
 ### Headless / agent mode
 
@@ -104,7 +111,9 @@ A modern Tauri UI lives in `gui/`:
   several with **Browse**, click a drive, or **Scan all drives**. Each scan gets
   its own entry in the sidebar with live progress (drive scans show an estimate
   against the drive's used space); a configurable number run in parallel, the
-  rest wait in a queue. Switch between finished scans without losing your place.
+  rest wait in a queue — drives nothing is reading yet go first, so "Scan all
+  drives" reads every disk at once. Switch between finished scans without
+  losing your place; cancelling stops a walk at once.
 - **Dashboard per scan** — headline cards (size and share of the drive, files and
   average size, folders, biggest folder and file, free space, scan speed and
   skipped entries), a **two-level treemap** (each big folder frames its own
@@ -112,17 +121,26 @@ A modern Tauri UI lives in `gui/`:
   everything else / free, and **what it is made of** by file type. Tabs below
   list folders, the biggest files (filterable), every extension, the spread over
   size ranges, and the changes since an earlier scan. Click anything to drill in
-  — served from the in-memory tree, so it is instant; **Rescan** walks again.
+  — served from the in-memory tree, so it is instant; go back with **Back**, the
+  mouse's back button or Alt+←, and up with **Up**, a right-click on the map,
+  Backspace or Alt+↑. **Rescan** walks again.
 - **Exclude templates** — switch on well-known build output, caches and system
   files per ecosystem (Node, Python, Rust, .NET, Gradle, C/C++, VCS, IDE folders,
   temp files, Windows/macOS system files …), turn single patterns off, or add
   your own; patterns are validated before they are used.
-- **Settings** — list length, max depth, symlinks, parallel scans, duplicate
-  minimum size, Recycle Bin vs. permanent delete, window size at start (1440p if
-  it fits the screen, otherwise maximized; or 1080p / 4K / maximized), language.
+- **Settings** — scan engine (**Fast** for SSD/NVMe: many directories at once;
+  **Gentle** for spinning disks, network drives or scanning in the background),
+  list length, max depth, symlinks, parallel scans, snapshots kept per folder,
+  duplicate minimum size, Recycle Bin vs. permanent delete, window size at start
+  (1440p if it fits the screen, otherwise maximized; or 1080p / 4K / maximized),
+  language. The version is shown next to the name.
 - **Find duplicates** to sort/filter groups and reclaim their space with one
-  click. Every complete scan is kept as a snapshot; **Changes** compares against
-  an earlier one and tints the treemap and folder rows by what grew or shrank.
+  click. Every complete scan is kept as a snapshot (in the background, so the
+  result shows at once); **Changes** lists them with their size on disk,
+  compares the folder on screen against any of them — folders and single files
+  — and tints the treemap and folder rows by what grew or shrank.
+- **Never blocking** — every command runs off the UI thread and each scan has
+  its own lock, so browsing one scan never waits for another.
 
 From `gui/src-tauri`:
 
@@ -133,9 +151,14 @@ cargo tauri build    # bundle an installer
 
 ## Why it's fast — and correct
 
-- Parallel directory walk across all cores; a **single pass** counts files *and*
-  directories, and builds the whole tree in memory so navigating it costs no
-  further I/O.
+- Parallel directory walk on a thread pool per scan; a **single pass** counts
+  files *and* directories, and builds the whole tree in memory (names only, not
+  full paths) so navigating it costs no further I/O.
+- File sizes come from the directory listing itself — on Windows no file is
+  opened at all, which used to be most of a scan's cost.
+- Where a disk holds millions of tiny folders, opening the folders themselves
+  becomes the limit: reading the NTFS master file table directly would be faster
+  still, but needs administrator rights, so Diskghost does not do it.
 - Duplicate detection never hashes more than it must: size buckets first, hard
   links collapsed, a cheap first-block pre-hash, then BLAKE3 — streamed, so large
   files never load into RAM.
@@ -164,6 +187,7 @@ Diskghost/
 - [x] Interactive treemap drill-up / breadcrumbs, served from an in-memory tree
 - [x] Snapshots &amp; "what grew since last time" (CLI `--save`/`--since`/`diff`, GUI history)
 - [x] GUI dashboard: parallel scans + queue, drives, nested treemap, file-type and size-range charts, exclude templates, settings
+- [x] Own parallel walker (no per-file open), file-level snapshots (zstd, streaming diff), non-blocking GUI
 
 ## Development
 

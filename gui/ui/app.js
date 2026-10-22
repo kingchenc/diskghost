@@ -39,7 +39,9 @@ const I18N = {
     queueInfo: (r, q, p) => `${r} running · ${q} queued · up to ${p} at once`,
     welcomeTitle: "Where did my disk space go?",
     welcomeText: "Drop one or more folders onto the window, pick a drive below, or use Browse. Every scan gets its own tab on the left — they run side by side or wait in the queue.",
-    up: "Up", rescan: "Rescan", dupesHere: "Find duplicates here",
+    up: "Up", back: "Back", rescan: "Rescan", dupesHere: "Find duplicates here",
+    backHint: "Previous folder (mouse back button, Alt+←)", upHint: "Parent folder (right-click the map, Backspace, Alt+↑)",
+    cancelling: "Cancelling…",
     cancelledNotice: "This scan was cancelled — every number covers only the part that was walked.",
     kSize: "Size", kSizeOfUsed: "of the used space on", kSizeOfDisk: "of the disk",
     kFiles: "Files", kAvg: "avg", kPerFile: "per file",
@@ -48,7 +50,7 @@ const I18N = {
     kFree: "Free on this drive", kUsedPct: "used",
     kScan: "Scan", kSkipped: "unreadable, skipped", kNoSkip: "nothing skipped",
     kSince: "Since",
-    map: "Map", mapSub: "Area = size. Click a folder to open it; hover for details.",
+    map: "Map", mapSub: "Area = size. Click to open a folder, right-click to go up, hover for details.",
     filesHere: "files directly in this folder", otherFolders: "smaller folders", filesSmaller: "files & smaller folders",
     shareOfView: "of this folder", folderFiles: "Files",
     types: "What it is made of", typesSub: "by file type, size on disk",
@@ -63,6 +65,11 @@ const I18N = {
     firstScan: "First scan of this folder — come back after the next scan to see what grew.",
     changes: "Changes since", unchanged: "Nothing changed.", newBadge: "new",
     grew: "Grew", shrank: "Shrank", newFolders: "New folders", removedFolders: "Removed folders",
+    newFiles: "New files", removedFiles: "Removed files", changedFiles: "Changed files", biggest: "biggest",
+    oldSnapshotNoFiles: "That snapshot comes from an older version and only knows folders — file changes show up from the next comparison on.",
+    snapshots: "Saved snapshots", onDisk: "on disk", thisScan: "this scan", filesAndFolders: "files & folders",
+    foldersOnly: "folders only", compare: "Compare", deleteSnapshot: "Delete this snapshot?",
+    snapshotsHint: (n) => `Every complete scan is saved automatically (all folders and files, compressed); the newest ${n} per folder are kept — see Settings.`,
     noDupes: "No duplicates found 🎉", groups: "groups", reclaimable: "reclaimable",
     filter: "Filter", sort: "Sort", dryRun: "Dry-run", reclaimShown: "Reclaim shown",
     sortWasted: "wasted", sortSize: "size", sortCount: "count",
@@ -88,6 +95,10 @@ const I18N = {
     setParallel: "Parallel scans", setParallelD: "Scans running at the same time; more wait in the queue. 1 is best for a single HDD.",
     setDupes: "Duplicates", setMinMb: "Ignore files smaller than (MB)",
     setDelete: "Deleting", setTrash: "Send deleted items to the Recycle Bin", setTrashD: "Off deletes permanently.",
+    setEngine: "Scan engine", engineFast: "Fast — SSD / NVMe (default)", engineGentle: "Gentle — HDD / in the background",
+    engineFastD: "Lists many folders at once (2 threads per CPU core). Fastest on SSDs; on a spinning disk the head jumps around and it can get slower.",
+    engineGentleD: "3 threads. Best for spinning disks and network drives, and keeps the PC responsive while it scans — slower on SSDs.",
+    setKeep: "Snapshots kept per folder", setKeepD: "Older ones are deleted automatically. About 8 bytes per file each.",
     setLook: "Window & language", setWin: "Window size at start", setLang: "Language",
     winAuto: "Auto (1440p if it fits, else maximized)", winMax: "Maximized", win1080: "1920 × 1080", win1440: "2560 × 1440", win4k: "3840 × 2160 (4K)",
     langAuto: "System", langEn: "English", langDe: "Deutsch",
@@ -115,7 +126,9 @@ const I18N = {
     queueInfo: (r, q, p) => `${r} laufen · ${q} warten · bis zu ${p} gleichzeitig`,
     welcomeTitle: "Wo ist mein Speicherplatz hin?",
     welcomeText: "Zieh einen oder mehrere Ordner aufs Fenster, wähle unten ein Laufwerk oder nutze Durchsuchen. Jeder Scan bekommt links einen eigenen Eintrag — sie laufen parallel oder warten in der Warteschlange.",
-    up: "Hoch", rescan: "Neu scannen", dupesHere: "Duplikate hier finden",
+    up: "Hoch", back: "Zurück", rescan: "Neu scannen", dupesHere: "Duplikate hier finden",
+    backHint: "Vorheriger Ordner (Maus-Zurück-Taste, Alt+←)", upHint: "Übergeordneter Ordner (Rechtsklick auf die Karte, Rücktaste, Alt+↑)",
+    cancelling: "Breche ab…",
     cancelledNotice: "Dieser Scan wurde abgebrochen — alle Zahlen decken nur den gescannten Teil ab.",
     kSize: "Größe", kSizeOfUsed: "des belegten Platzes auf", kSizeOfDisk: "der Platte",
     kFiles: "Dateien", kAvg: "Ø", kPerFile: "pro Datei",
@@ -124,7 +137,7 @@ const I18N = {
     kFree: "Frei auf diesem Laufwerk", kUsedPct: "belegt",
     kScan: "Scan", kSkipped: "nicht lesbar, übersprungen", kNoSkip: "nichts übersprungen",
     kSince: "Seit",
-    map: "Karte", mapSub: "Fläche = Größe. Ordner anklicken zum Öffnen, drüberfahren für Details.",
+    map: "Karte", mapSub: "Fläche = Größe. Klick öffnet einen Ordner, Rechtsklick geht hoch, drüberfahren zeigt Details.",
     filesHere: "Dateien direkt in diesem Ordner", otherFolders: "kleinere Ordner", filesSmaller: "Dateien & kleinere Ordner",
     shareOfView: "dieses Ordners", folderFiles: "Dateien",
     types: "Woraus es besteht", typesSub: "nach Dateityp, Größe auf der Platte",
@@ -139,6 +152,11 @@ const I18N = {
     firstScan: "Erster Scan dieses Ordners — nach dem nächsten Scan siehst du hier, was gewachsen ist.",
     changes: "Änderungen seit", unchanged: "Nichts geändert.", newBadge: "neu",
     grew: "Gewachsen", shrank: "Geschrumpft", newFolders: "Neue Ordner", removedFolders: "Entfernte Ordner",
+    newFiles: "Neue Dateien", removedFiles: "Entfernte Dateien", changedFiles: "Geänderte Dateien", biggest: "die größten",
+    oldSnapshotNoFiles: "Dieser Snapshot stammt aus einer älteren Version und kennt nur Ordner — Dateiänderungen gibt es ab dem nächsten Vergleich.",
+    snapshots: "Gespeicherte Snapshots", onDisk: "auf der Platte", thisScan: "dieser Scan", filesAndFolders: "Dateien & Ordner",
+    foldersOnly: "nur Ordner", compare: "Vergleichen", deleteSnapshot: "Diesen Snapshot löschen?",
+    snapshotsHint: (n) => `Jeder vollständige Scan wird automatisch gespeichert (alle Ordner und Dateien, komprimiert); die neuesten ${n} pro Ordner bleiben — siehe Einstellungen.`,
     noDupes: "Keine Duplikate gefunden 🎉", groups: "Gruppen", reclaimable: "freigebbar",
     filter: "Filter", sort: "Sortierung", dryRun: "Testlauf", reclaimShown: "Angezeigte freigeben",
     sortWasted: "verschwendet", sortSize: "Größe", sortCount: "Anzahl",
@@ -162,6 +180,10 @@ const I18N = {
     setParallel: "Parallele Scans", setParallelD: "Gleichzeitig laufende Scans; weitere warten. 1 ist am besten für eine einzelne HDD.",
     setDupes: "Duplikate", setMinMb: "Dateien kleiner als (MB) ignorieren",
     setDelete: "Löschen", setTrash: "Gelöschtes in den Papierkorb", setTrashD: "Aus löscht endgültig.",
+    setEngine: "Scan-Engine", engineFast: "Schnell — SSD / NVMe (Standard)", engineGentle: "Schonend — HDD / im Hintergrund",
+    engineFastD: "Liest viele Ordner gleichzeitig (2 Threads pro CPU-Kern). Am schnellsten auf SSDs; auf einer HDD springt der Lesekopf hin und her und es kann langsamer werden.",
+    engineGentleD: "3 Threads. Am besten für HDDs und Netzlaufwerke, und der PC bleibt beim Scannen flüssig — auf SSDs langsamer.",
+    setKeep: "Snapshots pro Ordner behalten", setKeepD: "Ältere werden automatisch gelöscht. Etwa 8 Byte pro Datei je Snapshot.",
     setLook: "Fenster & Sprache", setWin: "Fenstergröße beim Start", setLang: "Sprache",
     winAuto: "Auto (1440p wenn es passt, sonst maximiert)", winMax: "Maximiert", win1080: "1920 × 1080", win1440: "2560 × 1440", win4k: "3840 × 2160 (4K)",
     langAuto: "System", langEn: "English", langDe: "Deutsch",
@@ -217,18 +239,19 @@ const errText = (e) => (typeof e === "string" ? e : e?.message ?? JSON.stringify
 // One shared hover card. `content` is built lazily on enter.
 function tip(node, content) {
   const box = $("tooltip");
+  // Measured once per hover; moving only sets a transform (no layout work).
+  let w = 0, h = 0;
   const move = (ev) => {
     const pad = 16;
-    const r = box.getBoundingClientRect();
     let x = ev.clientX + pad, y = ev.clientY + pad;
-    if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - pad;
-    if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - pad;
-    box.style.left = `${Math.max(8, x)}px`;
-    box.style.top = `${Math.max(8, y)}px`;
+    if (x + w > innerWidth - 8) x = ev.clientX - w - pad;
+    if (y + h > innerHeight - 8) y = ev.clientY - h - pad;
+    box.style.transform = `translate(${Math.max(8, x)}px, ${Math.max(8, y)}px)`;
   };
   node.addEventListener("mouseenter", (ev) => {
     box.replaceChildren(...[content()].flat());
     box.classList.add("show");
+    ({ width: w, height: h } = box.getBoundingClientRect());
     move(ev);
   });
   node.addEventListener("mousemove", move);
@@ -266,6 +289,9 @@ function walkOpts() {
     exclude: activeExcludes(settings),
     max_depth: settings.max_depth,
     follow_symlinks: settings.follow_symlinks,
+    // "gentle" keeps a spinning disk from seeking itself to death and leaves
+    // the machine responsive; "fast" lets the walker pick (2 x CPU threads).
+    threads: settings.engine === "gentle" ? 3 : null,
   };
 }
 
@@ -379,7 +405,11 @@ function renderSettings() {
         field(t("setTop"), t("setTopD"), numberInput(settings.top, 1, 1000, (v) => set({ top: v ?? 50 }))),
         field(t("setDepth"), t("setDepthD"), numberInput(settings.max_depth, 1, 100, (v) => set({ max_depth: v }), "∞")),
         field(t("setParallel"), t("setParallelD"), numberInput(settings.parallel, 1, 8, (v) => { set({ parallel: v ?? 2 }); pump(); })),
-        checkField(t("setFollow"), t("setFollowD"), settings.follow_symlinks, (v) => set({ follow_symlinks: v })))),
+        checkField(t("setFollow"), t("setFollowD"), settings.follow_symlinks, (v) => set({ follow_symlinks: v }))),
+      el("div", { class: "set-grid" },
+        field(t("setEngine"), settings.engine === "gentle" ? t("engineGentleD") : t("engineFastD"),
+          selectInput(settings.engine, [["fast", t("engineFast")], ["gentle", t("engineGentle")]], (v) => set({ engine: v }, true))),
+        field(t("setKeep"), t("setKeepD"), numberInput(settings.keep_snapshots, 1, 100, (v) => set({ keep_snapshots: v ?? 10 }))))),
     el("section", { class: "set-sec" },
       el("h2", { text: `${t("setDupes")} & ${t("setDelete")}` }),
       el("div", { class: "set-grid" },
@@ -454,7 +484,9 @@ function enqueue(kind, path, { select = true } = {}) {
   const j = {
     id: nextId++, kind, root: path, path, opts, top: settings.top, mb: settings.min_mb,
     state: "queued", files: 0, bytes: 0, startedAt: 0, elapsedMs: null,
-    view: null, groups: null, error: null, refresh: false, tab: "folders",
+    view: null, groups: null, error: null, tab: "folders",
+    cache: new Map(), // folder -> view, so going back is instant
+    back: [], // folders visited before, for Back
   };
   jobs.push(j);
   if (select) activeId = j.id;
@@ -468,20 +500,32 @@ function pump() {
   renderQueueInfo();
 }
 
+// The sidebar always; the main area only if `j` is the job on screen — a scan
+// finishing in the background never rebuilds the view you are looking at.
+function renderFor(j) {
+  renderJobs();
+  renderQueueInfo();
+  if (!j || j.id === activeId) renderMain();
+}
+
 async function runJob(j) {
   j.state = "running";
   j.files = 0;
   j.bytes = 0;
   j.cancelRequested = false;
   j.startedAt = performance.now();
+  j.scanUnix = Math.floor(Date.now() / 1000);
   j.error = null;
-  renderAll();
+  renderFor(j);
   try {
     if (j.kind === "scan") {
-      const view = await invoke("scan_dir", { job: j.id, path: j.root, top: j.top, opts: j.opts, refresh: j.refresh });
-      j.refresh = false;
+      const view = await invoke("scan_dir", {
+        job: j.id, path: j.root, top: j.top, opts: j.opts, keepSnapshots: settings.keep_snapshots,
+      });
       j.elapsedMs = performance.now() - j.startedAt;
       j.root = String(view.root);
+      j.cache = new Map([[j.root, view]]);
+      j.back = [];
       j.view = view;
       j.path = j.root;
       j.diff = null;
@@ -489,7 +533,7 @@ async function runJob(j) {
       j.state = view.cancelled ? "cancelled" : "done";
       const back = j.returnTo;
       j.returnTo = null;
-      if (back && back !== j.root && !view.cancelled) navigate(j, back, true);
+      if (back && back !== j.root) navigate(j, back, { keepTab: true, record: false });
     } else {
       j.groups = await invoke("find_dupes", { job: j.id, path: j.root, mb: j.mb, opts: j.opts });
       j.elapsedMs = performance.now() - j.startedAt;
@@ -500,17 +544,16 @@ async function runJob(j) {
     j.state = "error";
     j.error = errText(e);
   }
-  if (byId(j.id)) {
-    renderAll();
-  }
+  if (byId(j.id)) renderFor(j);
   pump();
   if (j.kind === "scan" && j.state === "done") loadDrives();
 }
 
 async function cancelJob(j) {
   if (j.state === "queued") return closeJob(j);
-  if (j.state === "running" || j.loading) {
+  if (j.state === "running") {
     j.cancelRequested = true;
+    renderFor(j);
     try { await invoke("cancel", { job: j.id }); } catch (_) { /* finished meanwhile */ }
   }
 }
@@ -520,21 +563,20 @@ function closeJob(j) {
   const i = jobs.indexOf(j);
   if (i < 0) return;
   jobs.splice(i, 1);
-  // Free the tree's memory unless another open scan still shows it.
-  if (j.kind === "scan" && !jobs.some((o) => o.kind === "scan" && o.root === j.root)) {
-    invoke("forget_tree", { root: j.root }).catch(() => {});
-  }
+  // Free the tree's memory.
+  if (j.kind === "scan") invoke("forget_tree", { job: j.id }).catch(() => {});
   if (activeId === j.id) activeId = (jobs[i] || jobs[i - 1])?.id ?? null;
   pump();
   renderAll();
 }
 
 function selectJob(id) {
+  if (activeId === id) return;
   activeId = id;
   const j = active();
   if (j && j.stale && j.kind === "scan" && j.view) {
     j.stale = false;
-    navigate(j, j.path, true);
+    navigate(j, j.path, { keepTab: true, record: false, force: true });
   }
   renderAll();
 }
@@ -543,37 +585,50 @@ function rescan(j) {
   j.opts = walkOpts();
   j.top = settings.top;
   j.mb = settings.min_mb;
-  j.refresh = true;
   j.returnTo = j.kind === "scan" ? j.path : null;
   j.state = "queued";
   pump();
   renderAll();
 }
 
-// Open `path` inside job `j`: served from the job's cached tree, so it is
-// instant. (If the tree was dropped — e.g. after a failed delete — the folder
-// is walked again with live progress.)
-async function navigate(j, path, keepTab = false) {
-  j.loading = true;
-  j.files = 0;
-  j.bytes = 0;
-  j.startedAt = performance.now();
+// Open `path` inside job `j` — from the job's view cache (instant) or from
+// its tree in memory (a fraction of a second). Never walks the disk.
+async function navigate(j, path, { keepTab = false, record = true, force = false } = {}) {
+  if (!force && j.view && path === j.path) return;
+  if (record && j.path !== path) j.back.push(j.path);
   if (!keepTab && j.tab === "changes") j.tab = "folders";
-  renderAll();
-  try {
-    const view = await invoke("scan_dir", { job: j.id, path, top: j.top, opts: j.opts, refresh: false });
-    j.view = view;
-    j.path = String(view.root);
+  const show = (v) => {
+    j.view = v;
+    j.path = String(v.root);
     j.diff = null;
-    j.history = null;
     j.fileFilter = "";
     j.catFilter = "";
-  } catch (e) {
-    status(errText(e), true);
-  } finally {
     j.loading = false;
-    if (byId(j.id)) renderAll();
+    if (byId(j.id)) renderFor(j);
+  };
+  const cached = !force && j.cache.get(path);
+  if (cached) return show(cached);
+  j.loading = true;
+  $("main").classList.add("busy");
+  try {
+    const v = await invoke("view", { job: j.id, path, top: j.top });
+    j.cache.set(String(v.root), v);
+    show(v);
+  } catch (e) {
+    j.loading = false;
+    if (record) j.back.pop();
+    status(errText(e), true);
+    if (byId(j.id)) renderFor(j);
   }
+}
+
+function goBack(j) {
+  if (j?.view && j.back.length) navigate(j, j.back.pop(), { record: false });
+}
+
+function goUp(j) {
+  const up = j?.view && parentPath(j.path);
+  if (up && isUnder(up, j.root)) navigate(j, up);
 }
 
 // ------------------------------ rendering ------------------------------
@@ -604,8 +659,9 @@ function jobName(j) {
 
 function jobSub(j) {
   if (j.state === "queued") return `${t("stQueued")} · ${j.root}`;
-  if (j.state === "running" || j.loading) {
-    return `${j.kind === "dupes" ? t("stSearching") : j.loading ? t("stLoading") : t("stRunning")} · ${num(j.files)} ${t("files")} · ${human(j.bytes)}`;
+  if (j.state === "running") {
+    const what = j.cancelRequested ? t("cancelling") : j.kind === "dupes" ? t("stSearching") : t("stRunning");
+    return `${what} · ${num(j.files)} ${t("files")} · ${human(j.bytes)}`;
   }
   if (j.state === "error") return `${t("stError")}: ${j.error}`;
   if (j.kind === "dupes" && j.groups) {
@@ -636,10 +692,10 @@ function progressMeter(j) {
 function renderJobs() {
   const box = $("jobs");
   box.replaceChildren(...jobs.map((j) => {
-    const busy = j.state === "running" || j.loading;
+    const busy = j.state === "running";
     const closeBtn = el("button", {
       type: "button", class: "jclose", title: busy ? t("cancel") : t("close"),
-      onclick: (e) => { e.stopPropagation(); busy && j.state === "running" ? cancelJob(j) : closeJob(j); },
+      onclick: (e) => { e.stopPropagation(); busy ? cancelJob(j) : closeJob(j); },
     }, busy ? "⏹" : "✕");
     const row = el("div", {
       class: `job ${j.state}${j.id === activeId ? " active" : ""}`, role: "button", tabindex: "0",
@@ -659,11 +715,14 @@ function renderJobs() {
 
 function renderMain() {
   const main = $("main");
+  hideTip();
   if (mapObserver) { mapObserver.disconnect(); mapObserver = null; }
   const j = active();
+  main.classList.toggle("busy", Boolean(j?.loading));
+  if (j?.loading && j.view) return; // keep the current view until the next one is ready
   if (!j) return main.replaceChildren(welcomeView());
   if (j.state === "queued") return main.replaceChildren(queuedView(j));
-  if (j.state === "running" || j.loading) return main.replaceChildren(progressView(j));
+  if (j.state === "running") return main.replaceChildren(progressView(j));
   if (j.state === "error") return main.replaceChildren(errorView(j));
   if (j.kind === "dupes") return main.replaceChildren(dupesView(j));
   main.replaceChildren(scanView(j));
@@ -704,8 +763,8 @@ function progressView(j) {
   const secs = (performance.now() - j.startedAt) / 1000;
   const est = estimate(j);
   return el("div", { class: "center" }, el("div", { class: "card progress-card" },
-    el("h2", { text: j.kind === "dupes" ? t("stSearching") : j.loading ? t("stLoading") : t("stRunning") }),
-    el("div", { class: "path", text: j.loading ? j.path : j.root }),
+    el("h2", { text: j.kind === "dupes" ? t("stSearching") : t("stRunning") }),
+    el("div", { class: "path", text: j.root }),
     el("div", { class: "big", id: "pv-bytes", text: human(j.bytes) }),
     el("div", { class: "meter big" + (est == null ? " indeterminate" : ""), id: "pv-meter" },
       el("span", { class: "used", style: est == null ? {} : { width: `${est * 100}%` } })),
@@ -714,7 +773,8 @@ function progressView(j) {
       kpi(t("kFiles"), num(j.files), null, { id: "pv-files" }),
       kpi(t("elapsed"), fmtMs(secs * 1000), null, { id: "pv-time" }),
       kpi(t("rate"), secs > 0.5 ? num(Math.round(j.files / secs)) : "–", null, { id: "pv-rate" })),
-    el("div", {}, el("button", { type: "button", class: "danger", onclick: () => cancelJob(j) }, t("cancel")))));
+    el("div", {}, el("button", { type: "button", class: "danger", disabled: j.cancelRequested, onclick: () => cancelJob(j) },
+      j.cancelRequested ? t("cancelling") : t("cancel")))));
 }
 
 // Cheap in-place update of the progress card (no rebuild per event).
@@ -766,7 +826,8 @@ function scanView(j) {
   // Header: up, breadcrumbs (clickable inside this scan's tree), actions.
   const parent = parentPath(j.path);
   const head = el("div", { class: "viewhead" },
-    el("button", { type: "button", class: "small", disabled: !parent || !isUnder(parent, j.root), onclick: () => navigate(j, parent) }, `↑ ${t("up")}`),
+    el("button", { type: "button", class: "small", title: t("backHint"), disabled: !j.back.length, onclick: () => goBack(j) }, `← ${t("back")}`),
+    el("button", { type: "button", class: "small", title: t("upHint"), disabled: !parent || !isUnder(parent, j.root), onclick: () => goUp(j) }, `↑ ${t("up")}`),
     crumbBar(j),
     el("span", { class: "grow" }),
     el("button", { type: "button", class: "small", onclick: () => enqueue("dupes", j.path) }, `👯 ${t("dupesHere")}`),
@@ -779,7 +840,7 @@ function scanView(j) {
   // Map (left) and drive + file types (right).
   view.append(el("div", { class: "card", style: { gridColumn: "1" } },
     el("div", { class: "card-head" }, el("h2", { text: t("map") }), el("span", { class: "sub", text: t("mapSub") })),
-    el("div", { class: "treemap" })));
+    el("div", { class: "treemap", oncontextmenu: (e) => { e.preventDefault(); goUp(j); } })));
   view.append(el("div", { style: { display: "flex", flexDirection: "column", gap: "16px", minHeight: "0", gridColumn: "2" } },
     diskCard(v), typesCard(j, v)));
 
@@ -1143,31 +1204,38 @@ function sizesTab(v, body) {
 }
 
 // ------------------------------ what grew ---------------------------------
+// Every complete scan is stored as a snapshot of its root (every folder and
+// file, compressed). Compare the folder on screen against an earlier one.
 async function changesTab(j, v, body, tools) {
   if (v.cancelled) return body.append(el("div", { class: "muted", text: t("cancelledNotice") }));
   if (!j.history) {
     try {
-      const list = await invoke("list_snapshots", { path: j.path });
-      j.history = list.taken_at || [];
+      j.history = (await invoke("list_snapshots", { job: j.id })).snapshots || [];
     } catch (_) {
       j.history = [];
     }
     if (active() === j && j.tab === "changes") renderMain();
     return;
   }
-  if (j.history.length < 2) return body.append(el("div", { class: "muted", text: t("firstScan") }));
-  const chosen = j.sinceAt ?? j.history[1];
-  const sel = selectInput(String(chosen), j.history.map((ts) => [String(ts), fmtDate(ts)]), (val) => { j.sinceAt = parseInt(val, 10); });
-  tools.append(el("label", { class: "inlabel" }, `${t("since")} `, sel),
-    el("button", { type: "button", class: "small primary", onclick: () => showChanges(j) }, t("showChanges")));
+  // Snapshots older than this scan; the newest one is usually the scan itself.
+  const older = j.history.filter((s) => s.taken_at < j.scanUnix);
+  if (older.length) {
+    const chosen = older.some((s) => s.taken_at === j.sinceAt) ? j.sinceAt : older[0].taken_at;
+    const sel = selectInput(String(chosen), older.map((s) => [String(s.taken_at), `${fmtDate(s.taken_at)}${s.files ? "" : ` (${t("foldersOnly")})`}`]),
+      (val) => { j.sinceAt = parseInt(val, 10); });
+    tools.append(el("label", { class: "inlabel" }, `${t("since")} `, sel),
+      el("button", { type: "button", class: "small primary", onclick: () => showChanges(j, parseInt(sel.value, 10)) }, t("showChanges")));
+  }
   if (j.diff) renderChanges(j.diff, body, j);
+  else if (!older.length) body.append(el("div", { class: "muted", text: t("firstScan") }));
+  snapshotList(j, body);
 }
 
-async function showChanges(j) {
-  const takenAt = j.sinceAt ?? j.history[1];
+async function showChanges(j, takenAt) {
+  j.sinceAt = takenAt;
   status(t("comparing"));
   try {
-    j.diff = await invoke("diff_since", { path: j.path, takenAt, top: j.top });
+    j.diff = await invoke("diff_since", { job: j.id, path: j.path, takenAt, top: j.top });
     status("");
   } catch (e) {
     status(errText(e), true);
@@ -1175,32 +1243,75 @@ async function showChanges(j) {
   if (active() === j) renderMain();
 }
 
+// The stored snapshots of this scan's root: when, how big on disk, compare
+// or delete.
+function snapshotList(j, box) {
+  if (!j.history.length) return;
+  const total = j.history.reduce((a, s) => a + s.bytes, 0);
+  box.append(el("h3", { text: `${t("snapshots")} — ${j.history.length} · ${human(total)} ${t("onDisk")}`, style: { margin: "18px 0 6px" } }));
+  box.append(el("div", { class: "muted", text: t("snapshotsHint")(settings.keep_snapshots) }));
+  box.append(el("table", { class: "table" }, el("tbody", {}, j.history.map((s) => {
+    const current = s.taken_at >= j.scanUnix;
+    return el("tr", {},
+      el("td", { text: fmtDate(s.taken_at) }),
+      el("td", { class: "muted", text: current ? t("thisScan") : s.files ? t("filesAndFolders") : t("foldersOnly") }),
+      el("td", { class: "num", text: human(s.bytes) }),
+      el("td", { class: "acts" },
+        current ? null : el("button", { type: "button", class: "small", onclick: () => showChanges(j, s.taken_at) }, t("compare")),
+        el("button", {
+          type: "button", class: "del", title: t("del"),
+          onclick: async () => {
+            if (!(await ask(t("deleteSnapshot"), [{ text: fmtDate(s.taken_at) }], t("del"), true))) return;
+            try { await invoke("delete_snapshot", { job: j.id, takenAt: s.taken_at }); } catch (e) { status(errText(e), true); }
+            j.history = null;
+            if (j.diff?.old_taken_at === s.taken_at) j.diff = null;
+            if (active() === j) renderMain();
+          },
+        }, "🗑")));
+  }))));
+}
+
 function renderChanges(d, box, j) {
   const tint = deltaTint(d.delta, Math.abs(d.delta));
   box.append(el("div", { class: "chead" },
     el("span", { class: `delta-big ${tint.cls}`, text: humanDelta(d.delta) }),
     el("span", { class: "muted", text: `${t("changes")} ${fmtDate(d.old_taken_at)}: ${human(d.old_size)} → ${human(d.new_size)}, ${d.files_delta >= 0 ? "+" : ""}${num(d.files_delta)} ${t("files")}` })));
-  if (!d.grown.length && !d.shrunk.length && !d.added.length && !d.removed.length) {
+  if (d.files_compared) {
+    box.append(el("div", { class: "kpis", style: { margin: "10px 0" } },
+      kpi(t("newFiles"), num(d.new_files_count), `+${human(d.new_files_bytes)}`, {}, d.new_files_count ? "grow" : ""),
+      kpi(t("removedFiles"), num(d.removed_files_count), `-${human(d.removed_files_bytes)}`, {}, d.removed_files_count ? "shrink" : ""),
+      kpi(t("changedFiles"), num(d.changed_files_count), humanDelta(d.changed_files_delta), {}, deltaTint(d.changed_files_delta, 1).cls)));
+  } else {
+    box.append(el("div", { class: "muted", text: t("oldSnapshotNoFiles") }));
+  }
+  const unchanged = !d.grown.length && !d.shrunk.length && !d.added.length && !d.removed.length &&
+    !d.new_files_count && !d.removed_files_count && !d.changed_files_count;
+  if (unchanged) {
     box.append(el("div", { class: "ok", text: t("unchanged") }));
     return;
   }
-  const section = (title, items, cols) => {
+  const section = (title, items, cols, total) => {
     if (!items.length) return;
-    box.append(el("h3", { text: title, style: { margin: "14px 0 6px" } }));
+    const more = total > items.length ? ` — ${t("biggest")} ${num(items.length)} / ${num(total)}` : "";
+    box.append(el("h3", { text: `${title}${more}`, style: { margin: "14px 0 6px" } }));
     box.append(el("table", { class: "table" }, el("tbody", {}, items.map(cols))));
   };
-  const deltaRow = (x) => el("tr", { class: "click", onclick: () => navigate(j, x.path) },
-    el("td", { class: "num", style: { width: "110px" } }, el("span", { class: `delta ${x.delta > 0 ? "grow" : "shrink"}`, text: humanDelta(x.delta) })),
-    el("td", { class: "namecell" }, el("div", { class: "nm", text: baseName(x.path) }), el("div", { class: "pth", text: x.path })),
+  const nameCells = (x) => el("td", { class: "namecell" }, el("div", { class: "nm", text: baseName(x.path) }), el("div", { class: "pth", text: x.path }));
+  const deltaRow = (clickable) => (x) => el("tr", { class: clickable ? "click" : "", onclick: clickable ? () => navigate(j, x.path) : null },
+    el("td", { class: "num", style: { width: "120px" } }, el("span", { class: `delta ${x.delta > 0 ? "grow" : "shrink"}`, text: humanDelta(x.delta) })),
+    nameCells(x),
     el("td", { class: "num", text: `${human(x.old_size)} → ${human(x.new_size)}` }));
   const sizeRow = (clickable) => (x) => el("tr", { class: clickable ? "click" : "", onclick: clickable ? () => navigate(j, x.path) : null },
-    el("td", { class: "num", style: { width: "110px" }, text: human(x.size) }),
-    el("td", { class: "namecell" }, el("div", { class: "nm", text: baseName(x.path) }), el("div", { class: "pth", text: x.path })),
+    el("td", { class: "num", style: { width: "120px" }, text: human(x.size) }),
+    nameCells(x),
     el("td"));
-  section(t("grew"), d.grown, deltaRow);
-  section(t("shrank"), d.shrunk, deltaRow);
+  section(t("grew"), d.grown, deltaRow(true));
+  section(t("shrank"), d.shrunk, deltaRow(true));
   section(t("newFolders"), d.added, sizeRow(true));
   section(t("removedFolders"), d.removed, sizeRow(false));
+  section(t("newFiles"), d.new_files_list, deltaRow(false), d.new_files_count);
+  section(t("changedFiles"), d.changed_files_list, deltaRow(false), d.changed_files_count);
+  section(t("removedFiles"), d.removed_files_list, deltaRow(false), d.removed_files_count);
 }
 
 // -------------------------------- delete ----------------------------------
@@ -1227,9 +1338,12 @@ async function deletePath(path) {
   }
   for (const j of jobs) {
     if (j.kind !== "scan" || !j.view || !isUnder(path, j.root)) continue;
+    // The backend took the path out of the tree; cached views are outdated.
+    j.cache.clear();
+    j.back = j.back.filter((p) => !isUnder(p, path));
     // Stay in the deleted folder's parent if the view was inside it.
     if (isUnder(j.path, path)) j.path = parentPath(path) || j.root;
-    if (j === active()) navigate(j, j.path, true);
+    if (j === active()) navigate(j, j.path, { keepTab: true, record: false, force: true });
     else j.stale = true;
   }
   loadDrives();
@@ -1318,7 +1432,11 @@ async function reclaimShown(j, dryRun) {
     status(`${rep.dry_run ? "DRY-RUN" : "OK"}: ${num(rep.removed)} ${t("files")}, ${human(rep.reclaimed)} ${t("reclaimable")}` +
       (rep.errors.length ? `, ${rep.errors.length} ${t("errors")}` : ""), rep.errors.length > 0);
     if (!rep.dry_run) {
-      for (const o of jobs) if (o.kind === "scan" && isUnder(j.root, o.root)) o.stale = true;
+      for (const o of jobs) {
+        if (o.kind !== "scan" || !(isUnder(j.root, o.root) || isUnder(o.root, j.root))) continue;
+        o.cache.clear();
+        o.stale = true;
+      }
       rescan(j);
       loadDrives();
     }
@@ -1354,7 +1472,7 @@ let paintQueued = false;
 try {
   window.__TAURI__?.event?.listen?.("progress", (e) => {
     const j = e.payload && byId(e.payload.job);
-    if (!j || !(j.state === "running" || j.loading)) return;
+    if (!j || j.state !== "running") return;
     j.files = e.payload.files;
     j.bytes = e.payload.bytes;
     if (paintQueued) return;
@@ -1363,7 +1481,7 @@ try {
       paintQueued = false;
       renderJobs();
       const a = active();
-      if (a && (a.state === "running" || a.loading)) updateProgressView(a);
+      if (a && a.state === "running") updateProgressView(a);
     });
   });
 } catch (_) { /* events unavailable */ }
@@ -1381,7 +1499,33 @@ try {
   }
 } catch (_) { /* drag-drop unavailable */ }
 
+// Back / up without reaching for the toolbar: the mouse's back button,
+// Alt+Left, Alt+Up and Backspace (outside text fields).
+window.addEventListener("mouseup", (e) => {
+  if (e.button === 3) { e.preventDefault(); goBack(active()); }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.target.closest?.("input, textarea, select, dialog")) return;
+  const j = active();
+  if (!j?.view) return;
+  if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); goBack(j); }
+  else if ((e.altKey && e.key === "ArrowUp") || e.key === "Backspace") { e.preventDefault(); goUp(j); }
+});
+
+// A finished scan's snapshot is written in the background; refresh the list.
+try {
+  window.__TAURI__?.event?.listen?.("snapshot-saved", (e) => {
+    const [id, err] = e.payload || [];
+    const j = byId(id);
+    if (err) status(err, true);
+    if (!j) return;
+    j.history = null;
+    if (j === active() && j.tab === "changes") renderMain();
+  });
+} catch (_) { /* events unavailable */ }
+
 (async function start() {
+  invoke("app_version").then((v) => { $("version").textContent = `v${v}`; }).catch(() => {});
   try { settings = mergeSettings(await invoke("load_settings")); } catch (_) { /* defaults */ }
   applyI18n();
   updateExcludeChip();

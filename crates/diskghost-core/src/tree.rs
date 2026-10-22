@@ -1,99 +1,174 @@
 //! The whole directory tree from a single walk, held in memory so a UI can
 //! drill into any sub-folder — and back up — without touching the disk again.
 //!
-//! Nodes live in an arena (`Vec<Node>`) and are looked up by path through an
-//! index. A node's totals (`size`, `file_count`, `dir_count`) always cover its
-//! entire subtree; the files sitting directly in a directory are kept on that
-//! node so any sub-folder can produce the same [`ScanReport`] a fresh scan of
-//! it would.
+//! Nodes live in an arena (`Vec<Node>`). Each keeps only its own name: full
+//! paths are rebuilt from the parent chain when a report needs one, and a path
+//! is found by descending from the root through children kept sorted by name.
+//! That keeps a multi-million-file tree to a fraction of the memory full paths
+//! would take. A node's totals (`size`, `file_count`, `dir_count`) always
+//! cover its entire subtree; the files sitting directly in a directory are kept
+//! on that node so any sub-folder can produce the same [`ScanReport`] a fresh
+//! scan of it would.
 
-use std::cmp::Reverse;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap};
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf};
 
+use crate::walk::{walk, Batch};
 use crate::{
-    disk_space, walk, DirSize, ExtStat, FileEntry, FileStats, Options, Progress, ScanReport,
-    SizeBucket, SIZE_BUCKET_BOUNDS,
+    disk_space, DirSize, ExtStat, FileEntry, FileStats, Options, Progress, ScanReport, SizeBucket,
+    SIZE_BUCKET_BOUNDS,
 };
 
-struct Node {
-    path: PathBuf,
-    parent: Option<usize>,
-    /// Bytes in this directory and everything below it.
-    size: u64,
-    /// Files in this directory and everything below it.
-    file_count: u64,
-    /// Directories below this one (not counting itself).
-    dir_count: u64,
-    children: Vec<usize>,
-    /// Files sitting directly in this directory.
-    files: Vec<FileEntry>,
+/// A file sitting directly in a directory.
+pub(crate) struct FileRec {
+    pub(crate) name: Box<OsStr>,
+    pub(crate) size: u64,
+    logical_size: u64,
+    /// Index into [`ScanTree::exts`].
+    ext: u32,
 }
 
-impl Node {
-    fn new(path: PathBuf, parent: Option<usize>) -> Node {
-        Node {
-            path,
-            parent,
-            size: 0,
-            file_count: 0,
-            dir_count: 0,
-            children: Vec::new(),
-            files: Vec::new(),
-        }
-    }
+pub(crate) struct Node {
+    /// Own name; the root's full path is [`ScanTree::root`].
+    pub(crate) name: Box<OsStr>,
+    parent: Option<usize>,
+    /// Bytes in this directory and everything below it.
+    pub(crate) size: u64,
+    /// Files in this directory and everything below it.
+    pub(crate) file_count: u64,
+    /// Directories below this one (not counting itself).
+    dir_count: u64,
+    /// Sub-directories, sorted by name once the walk is done.
+    pub(crate) children: Vec<usize>,
+    /// Files directly in this directory, sorted by name once the walk is done.
+    pub(crate) files: Vec<FileRec>,
+}
+
+/// Byte order of two names — the order children and files are kept in.
+pub(crate) fn cmp_name(a: &OsStr, b: &OsStr) -> Ordering {
+    a.as_encoded_bytes().cmp(b.as_encoded_bytes())
 }
 
 /// An in-memory scan of a directory tree. Build it once with
 /// [`ScanTree::build`], then ask for a [`ScanReport`] of the root or of any
 /// sub-folder with [`ScanTree::report`] — no further I/O.
 pub struct ScanTree {
+    root: PathBuf,
     /// Arena; index 0 is always the root.
-    nodes: Vec<Node>,
-    index: HashMap<PathBuf, usize>,
+    pub(crate) nodes: Vec<Node>,
+    /// Lower-cased file extensions, indexed by [`FileRec::ext`].
+    exts: Vec<Box<str>>,
     skipped: u64,
     cancelled: bool,
     disk_total: u64,
     disk_free: u64,
 }
 
-impl ScanTree {
-    /// Walk `root` (honouring `opts`, reporting to `progress`) and build the tree.
-    pub fn build(root: &Path, opts: &Options, progress: &Progress) -> ScanTree {
-        let walked = walk(root, opts, progress);
-        let mut tree = ScanTree {
-            nodes: vec![Node::new(root.to_path_buf(), None)],
-            index: HashMap::new(),
-            skipped: walked.skipped,
-            cancelled: progress.cancelled(),
-            disk_total: 0,
-            disk_free: 0,
+/// Puts batches from the walk into the tree as they arrive (in any order).
+struct Builder {
+    tree: ScanTree,
+    /// Directories created but not listed yet, by path. A directory's own
+    /// batch can arrive before its parent's, so any missing ancestor is
+    /// created on the spot and found here later.
+    pending: HashMap<PathBuf, usize>,
+    ext_ids: HashMap<Box<str>, u32>,
+}
+
+impl Builder {
+    fn push(&mut self, parent: usize, name: &OsStr) -> usize {
+        let id = self.tree.nodes.len();
+        self.tree.nodes.push(Node::new(name, Some(parent)));
+        self.tree.nodes[parent].children.push(id);
+        id
+    }
+
+    fn dir_id(&mut self, path: &Path) -> usize {
+        if path == self.tree.root {
+            return 0;
+        }
+        if let Some(&id) = self.pending.get(path) {
+            return id;
+        }
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return 0;
         };
-        tree.index.insert(root.to_path_buf(), 0);
+        let parent = self.dir_id(parent);
+        let id = self.push(parent, name);
+        self.pending.insert(path.to_path_buf(), id);
+        id
+    }
 
-        for dir in walked.dirs {
-            tree.ensure_dir(&dir);
+    fn ext_id(&mut self, name: &OsStr) -> u32 {
+        let ext = Path::new(name).extension().unwrap_or_default();
+        let ext = ext.to_string_lossy();
+        let lower;
+        let key: &str = if ext
+            .bytes()
+            .any(|b| !b.is_ascii_lowercase() && !b.is_ascii_digit())
+        {
+            lower = ext.to_lowercase();
+            &lower
+        } else {
+            &ext
+        };
+        if let Some(&id) = self.ext_ids.get(key) {
+            return id;
         }
+        let id = self.tree.exts.len() as u32;
+        self.tree.exts.push(key.into());
+        self.ext_ids.insert(key.into(), id);
+        id
+    }
 
-        // Files of one directory arrive together, so remembering the last
-        // parent saves a hash lookup per file on the hot path.
-        let mut last: Option<(PathBuf, usize)> = None;
-        for file in walked.files {
-            let parent = file.path.parent().unwrap_or(root);
-            let id = match &last {
-                Some((p, id)) if p == parent => *id,
-                _ => {
-                    let id = tree.ensure_dir(parent);
-                    last = Some((parent.to_path_buf(), id));
-                    id
-                }
+    fn add(&mut self, batch: Batch) {
+        let id = self.dir_id(&batch.dir);
+        self.pending.remove(&batch.dir);
+        self.tree.skipped += batch.skipped;
+
+        // Children already here were created early, by a batch from deeper
+        // down that arrived first; don't create them twice.
+        let early: HashMap<Box<OsStr>, usize> = self.tree.nodes[id]
+            .children
+            .iter()
+            .map(|&c| (self.tree.nodes[c].name.clone(), c))
+            .collect();
+        for sub in batch.subdirs {
+            let Some(name) = sub.file_name() else {
+                continue;
             };
-            let node = &mut tree.nodes[id];
-            node.size += file.size;
-            node.file_count += 1;
-            node.files.push(file);
+            if early.contains_key(name) {
+                continue;
+            }
+            let cid = self.push(id, name);
+            self.pending.insert(sub, cid);
         }
 
+        let mut files = Vec::with_capacity(batch.files.len());
+        let mut size = 0u64;
+        for f in batch.files {
+            let Some(name) = f.path.file_name() else {
+                continue;
+            };
+            let ext = self.ext_id(name);
+            size += f.size;
+            files.push(FileRec {
+                name: name.into(),
+                size: f.size,
+                logical_size: f.logical_size,
+                ext,
+            });
+        }
+        let node = &mut self.tree.nodes[id];
+        node.size += size;
+        node.file_count += files.len() as u64;
+        node.files.extend(files);
+    }
+
+    fn finish(mut self, cancelled: bool) -> ScanTree {
+        let tree = &mut self.tree;
+        tree.cancelled = cancelled;
         // Roll the totals up. A child is always created after its parent, so
         // walking the arena backwards visits every node before its parent.
         for id in (1..tree.nodes.len()).rev() {
@@ -107,51 +182,98 @@ impl ScanTree {
                 pn.dir_count += dirs;
             }
         }
-
-        let (disk_total, disk_free) = disk_space(root);
+        // Sort children and files by name: lookups binary-search them, and
+        // snapshots list them in this order.
+        for id in 0..tree.nodes.len() {
+            let mut kids = std::mem::take(&mut tree.nodes[id].children);
+            kids.sort_by(|&a, &b| cmp_name(&tree.nodes[a].name, &tree.nodes[b].name));
+            tree.nodes[id].children = kids;
+            tree.nodes[id]
+                .files
+                .sort_by(|a, b| cmp_name(&a.name, &b.name));
+        }
+        let (disk_total, disk_free) = disk_space(&tree.root);
         tree.disk_total = disk_total;
         tree.disk_free = disk_free;
-        tree
+        self.tree
     }
+}
 
-    /// Node id of `path`, creating it (and any missing ancestors up to the
-    /// nearest known one) if needed. Every node is inserted after its parent.
-    fn ensure_dir(&mut self, path: &Path) -> usize {
-        if let Some(&id) = self.index.get(path) {
-            return id;
+impl Node {
+    fn new(name: &OsStr, parent: Option<usize>) -> Node {
+        Node {
+            name: name.into(),
+            parent,
+            size: 0,
+            file_count: 0,
+            dir_count: 0,
+            children: Vec::new(),
+            files: Vec::new(),
         }
-        let mut missing: Vec<PathBuf> = Vec::new();
-        let mut cur = path.to_path_buf();
-        let anchor = loop {
-            if let Some(&id) = self.index.get(&cur) {
-                break id;
-            }
-            missing.push(cur.clone());
-            match cur.parent() {
-                Some(p) => cur = p.to_path_buf(),
-                // Ran past every known ancestor: hang the chain off the root.
-                None => break 0,
-            }
+    }
+}
+
+impl ScanTree {
+    /// Walk `root` (honouring `opts`, reporting to `progress`) and build the
+    /// tree while the walk is still listing directories.
+    pub fn build(root: &Path, opts: &Options, progress: &Progress) -> ScanTree {
+        let mut b = Builder {
+            tree: ScanTree {
+                root: root.to_path_buf(),
+                nodes: vec![Node::new(OsStr::new(""), None)],
+                exts: Vec::new(),
+                skipped: 0,
+                cancelled: false,
+                disk_total: 0,
+                disk_free: 0,
+            },
+            pending: HashMap::new(),
+            ext_ids: HashMap::new(),
         };
-        let mut parent = anchor;
-        for p in missing.into_iter().rev() {
-            let id = self.nodes.len();
-            self.nodes.push(Node::new(p.clone(), Some(parent)));
-            self.nodes[parent].children.push(id);
-            self.index.insert(p, id);
-            parent = id;
-        }
-        parent
+        walk(root, opts, progress, |batch| b.add(batch));
+        b.finish(progress.cancelled())
     }
 
     /// The directory this tree was built from.
     pub fn root(&self) -> &Path {
-        &self.nodes[0].path
+        &self.root
+    }
+
+    /// Node id of the directory `path`, if it is in the tree.
+    fn find(&self, path: &Path) -> Option<usize> {
+        let rel = path.strip_prefix(&self.root).ok()?;
+        let mut id = 0;
+        for c in rel.components() {
+            let Component::Normal(name) = c else {
+                return None;
+            };
+            let kids = &self.nodes[id].children;
+            let pos = kids
+                .binary_search_by(|&k| cmp_name(&self.nodes[k].name, name))
+                .ok()?;
+            id = kids[pos];
+        }
+        Some(id)
+    }
+
+    /// Full path of node `id`, rebuilt from its parent chain.
+    pub(crate) fn path_of(&self, id: usize) -> PathBuf {
+        let mut names = Vec::new();
+        let mut cur = id;
+        while let Some(p) = self.nodes[cur].parent {
+            names.push(&*self.nodes[cur].name);
+            cur = p;
+        }
+        let mut path = self.root.clone();
+        for n in names.into_iter().rev() {
+            path.push(n);
+        }
+        path
     }
 
     /// Whether `path` is a directory in this tree (the root included).
     pub fn contains(&self, path: &Path) -> bool {
-        self.index.contains_key(path)
+        self.find(path).is_some()
     }
 
     /// True if the walk was cancelled; the tree then covers only what was seen.
@@ -161,7 +283,7 @@ impl ScanTree {
 
     /// Re-query the filesystem's total/free bytes (e.g. after deleting files).
     pub fn refresh_disk_space(&mut self) {
-        let (total, free) = disk_space(self.root());
+        let (total, free) = disk_space(&self.root);
         self.disk_total = total;
         self.disk_free = free;
     }
@@ -174,40 +296,48 @@ impl ScanTree {
     /// Report for `path` — the root or any directory below it — as if that
     /// directory had been scanned on its own. `None` if it is not in the tree.
     pub fn report(&self, path: &Path, top_n: usize) -> Option<ScanReport> {
-        let &id = self.index.get(path)?;
-        Some(self.report_of(id, top_n))
+        Some(self.report_of(self.find(path)?, top_n))
     }
 
     /// The `top_n` biggest immediate sub-folders of `path`, largest first —
     /// the `children` of its report without the rest. `None` if `path` is not
     /// in the tree.
     pub fn children(&self, path: &Path, top_n: usize) -> Option<Vec<DirSize>> {
-        let &id = self.index.get(path)?;
-        Some(self.children_of(id, top_n))
+        let id = self.find(path)?;
+        Some(self.children_of(id, &self.path_of(id), top_n))
     }
 
-    fn children_of(&self, id: usize, top_n: usize) -> Vec<DirSize> {
-        let mut kids: Vec<&Node> = self.nodes[id]
-            .children
-            .iter()
-            .map(|&c| &self.nodes[c])
-            .collect();
-        kids.sort_by_key(|k| Reverse(k.size));
+    fn children_of(&self, id: usize, base: &Path, top_n: usize) -> Vec<DirSize> {
+        let mut kids: Vec<usize> = self.nodes[id].children.clone();
+        kids.sort_by_key(|&k| Reverse(self.nodes[k].size));
         kids.iter()
             .take(top_n)
-            .map(|k| DirSize {
-                path: k.path.clone(),
-                size: k.size,
-                file_count: k.file_count,
+            .map(|&k| {
+                let n = &self.nodes[k];
+                DirSize {
+                    path: base.join(&*n.name),
+                    size: n.size,
+                    file_count: n.file_count,
+                }
             })
             .collect()
+    }
+
+    /// Every node id in the subtree of `id`, `id` included.
+    fn subtree(&self, id: usize) -> impl Iterator<Item = usize> + '_ {
+        let mut stack = vec![id];
+        std::iter::from_fn(move || {
+            let i = stack.pop()?;
+            stack.extend(self.nodes[i].children.iter().copied());
+            Some(i)
+        })
     }
 
     /// Bytes per file extension and per size range for every file at or
     /// below `path`. `None` if `path` is not in the tree.
     pub fn file_stats(&self, path: &Path) -> Option<FileStats> {
-        let &id = self.index.get(path)?;
-        let mut by_ext: HashMap<String, (u64, u64)> = HashMap::new();
+        let id = self.find(path)?;
+        let mut by_ext = vec![(0u64, 0u64); self.exts.len()];
         let mut buckets: Vec<SizeBucket> = SIZE_BUCKET_BOUNDS
             .iter()
             .map(|&b| Some(b))
@@ -218,30 +348,25 @@ impl ScanTree {
                 count: 0,
             })
             .collect();
-        let mut stack = vec![id];
-        while let Some(i) = stack.pop() {
-            let n = &self.nodes[i];
-            for f in &n.files {
-                let ext = f
-                    .path
-                    .extension()
-                    .map(|e| e.to_string_lossy().to_lowercase())
-                    .unwrap_or_default();
-                let e = by_ext.entry(ext).or_default();
+        for i in self.subtree(id) {
+            for f in &self.nodes[i].files {
+                let e = &mut by_ext[f.ext as usize];
                 e.0 += f.size;
                 e.1 += 1;
-                let b = SIZE_BUCKET_BOUNDS
-                    .iter()
-                    .position(|&bound| f.size < bound)
-                    .unwrap_or(SIZE_BUCKET_BOUNDS.len());
+                let b = SIZE_BUCKET_BOUNDS.partition_point(|&bound| bound <= f.size);
                 buckets[b].size += f.size;
                 buckets[b].count += 1;
             }
-            stack.extend(n.children.iter().copied());
         }
         let mut extensions: Vec<ExtStat> = by_ext
             .into_iter()
-            .map(|(ext, (size, count))| ExtStat { ext, size, count })
+            .enumerate()
+            .filter(|(_, (_, count))| *count > 0)
+            .map(|(i, (size, count))| ExtStat {
+                ext: self.exts[i].to_string(),
+                size,
+                count,
+            })
             .collect();
         extensions.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.ext.cmp(&b.ext)));
         Some(FileStats {
@@ -252,31 +377,44 @@ impl ScanTree {
 
     fn report_of(&self, id: usize, top_n: usize) -> ScanReport {
         let node = &self.nodes[id];
-        let children = self.children_of(id, top_n);
+        let base = self.path_of(id);
+        let children = self.children_of(id, &base, top_n);
 
         let root_files_size = node.files.iter().map(|f| f.size).sum();
         let root_files_count = node.files.len() as u64;
 
-        // Biggest files anywhere below `id`: gather the subtree, then select
-        // the top slice without sorting everything.
-        let mut all: Vec<&FileEntry> = Vec::new();
-        let mut stack = vec![id];
-        while let Some(i) = stack.pop() {
-            let n = &self.nodes[i];
-            all.extend(n.files.iter());
-            stack.extend(n.children.iter().copied());
+        // Biggest files anywhere below `id`: a min-heap holding the best
+        // `top_n` seen so far, so the subtree is scanned once without
+        // collecting it.
+        let mut heap: BinaryHeap<Reverse<(u64, usize, usize)>> = BinaryHeap::new();
+        if top_n > 0 {
+            for i in self.subtree(id) {
+                for (j, f) in self.nodes[i].files.iter().enumerate() {
+                    if heap.len() < top_n {
+                        heap.push(Reverse((f.size, i, j)));
+                    } else if heap.peek().is_some_and(|Reverse(min)| f.size > min.0) {
+                        heap.pop();
+                        heap.push(Reverse((f.size, i, j)));
+                    }
+                }
+            }
         }
-        if top_n == 0 {
-            all.clear();
-        } else if all.len() > top_n {
-            all.select_nth_unstable_by_key(top_n - 1, |f| Reverse(f.size));
-            all.truncate(top_n);
-        }
-        all.sort_by_key(|f| Reverse(f.size));
-        let top_files = all.into_iter().cloned().collect();
+        let mut top: Vec<(u64, usize, usize)> = heap.into_iter().map(|Reverse(x)| x).collect();
+        top.sort_by_key(|x| Reverse(x.0));
+        let top_files = top
+            .into_iter()
+            .map(|(_, i, j)| {
+                let f = &self.nodes[i].files[j];
+                FileEntry {
+                    path: self.path_of(i).join(&*f.name),
+                    size: f.size,
+                    logical_size: f.logical_size,
+                }
+            })
+            .collect();
 
         ScanReport {
-            root: node.path.clone(),
+            root: base,
             total_size: node.size,
             total_files: node.file_count,
             total_dirs: node.dir_count,
@@ -294,21 +432,25 @@ impl ScanTree {
     /// Every directory below the root with its subtree totals, sorted by path.
     /// The root itself is not included.
     pub fn dir_sizes(&self) -> Vec<DirSize> {
-        let mut dirs: Vec<DirSize> = self
-            .index
-            .values()
-            .filter(|&&id| id != 0)
-            .map(|&id| {
-                let n = &self.nodes[id];
-                DirSize {
-                    path: n.path.clone(),
-                    size: n.size,
-                    file_count: n.file_count,
-                }
-            })
+        let mut out = Vec::with_capacity(self.nodes.len());
+        let mut stack: Vec<(usize, PathBuf)> = self.nodes[0]
+            .children
+            .iter()
+            .rev()
+            .map(|&c| (c, self.root.join(&*self.nodes[c].name)))
             .collect();
-        dirs.sort_by(|a, b| a.path.cmp(&b.path));
-        dirs
+        while let Some((id, path)) = stack.pop() {
+            let n = &self.nodes[id];
+            for &c in n.children.iter().rev() {
+                stack.push((c, path.join(&*self.nodes[c].name)));
+            }
+            out.push(DirSize {
+                path,
+                size: n.size,
+                file_count: n.file_count,
+            });
+        }
+        out
     }
 
     /// Drop a directory (with everything below it) or a single file from the
@@ -316,37 +458,33 @@ impl ScanTree {
     /// the path on disk, instead of re-walking. The root cannot be removed.
     /// Returns `false` if the path is not in the tree.
     pub fn remove(&mut self, path: &Path) -> bool {
-        if let Some(&id) = self.index.get(path) {
-            if id == 0 {
-                return false;
-            }
-            let node = &self.nodes[id];
-            let (size, files, dirs, parent) =
-                (node.size, node.file_count, node.dir_count + 1, node.parent);
-            // Unindex the subtree; the arena slots simply become unreachable.
+        if let Some(id) = self.find(path) {
+            let Some(parent) = self.nodes[id].parent else {
+                return false; // the root
+            };
+            let n = &self.nodes[id];
+            let (size, files, dirs) = (n.size, n.file_count, n.dir_count + 1);
+            self.nodes[parent].children.retain(|&c| c != id);
+            self.subtract(parent, size, files, dirs);
+            // The subtree is unreachable now; give its memory back.
             let mut stack = vec![id];
             while let Some(i) = stack.pop() {
-                let p = std::mem::take(&mut self.nodes[i].path);
-                self.index.remove(&p);
-                self.nodes[i].files.clear();
+                self.nodes[i].files = Vec::new();
                 stack.extend(std::mem::take(&mut self.nodes[i].children));
-            }
-            if let Some(p) = parent {
-                self.nodes[p].children.retain(|&c| c != id);
-                self.subtract(p, size, files, dirs);
             }
             return true;
         }
-        let Some(parent) = path.parent() else {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
             return false;
         };
-        let Some(&pid) = self.index.get(parent) else {
+        let Some(pid) = self.find(parent) else {
             return false;
         };
-        let Some(pos) = self.nodes[pid].files.iter().position(|f| f.path == path) else {
+        let files = &mut self.nodes[pid].files;
+        let Ok(pos) = files.binary_search_by(|f| cmp_name(&f.name, name)) else {
             return false;
         };
-        let file = self.nodes[pid].files.swap_remove(pos);
+        let file = files.remove(pos);
         self.subtract(pid, file.size, 1, 0);
         true
     }
@@ -566,15 +704,56 @@ mod tests {
     }
 
     #[test]
-    fn missing_ancestors_are_created_on_demand() {
-        let d = tmpdir("ensure");
-        let mut tree = ScanTree::build(&d, &Options::default(), &Progress::default());
-        let deep = d.join("p/q/r");
-        let id = tree.ensure_dir(&deep);
-        assert_eq!(tree.nodes[id].path, deep);
-        assert!(tree.contains(&d.join("p")));
-        assert!(tree.contains(&d.join("p/q")));
-        assert_eq!(tree.ensure_dir(&deep), id);
-        std::fs::remove_dir_all(&d).ok();
+    fn batches_in_any_order_build_one_tree() {
+        // The walk hands over directories in whatever order its threads finish:
+        // a deep batch first creates its missing ancestors, and the parents'
+        // own batches later must not create them a second time.
+        let root = PathBuf::from("/r");
+        let batch = |dir: &str, subdirs: &[&str], files: &[(&str, u64)]| Batch {
+            dir: PathBuf::from(dir),
+            files: files
+                .iter()
+                .map(|&(p, size)| FileEntry {
+                    path: PathBuf::from(p),
+                    size,
+                    logical_size: size,
+                })
+                .collect(),
+            subdirs: subdirs.iter().map(PathBuf::from).collect(),
+            others: Vec::new(),
+            skipped: 0,
+        };
+        let mut b = Builder {
+            tree: ScanTree {
+                root: root.clone(),
+                nodes: vec![Node::new(OsStr::new(""), None)],
+                exts: Vec::new(),
+                skipped: 0,
+                cancelled: false,
+                disk_total: 0,
+                disk_free: 0,
+            },
+            pending: HashMap::new(),
+            ext_ids: HashMap::new(),
+        };
+        b.add(batch("/r/p/q", &[], &[("/r/p/q/a.TXT", 5)]));
+        b.add(batch("/r", &["/r/p", "/r/z"], &[("/r/top.bin", 1)]));
+        b.add(batch("/r/p", &["/r/p/q"], &[("/r/p/b.txt", 2)]));
+        b.add(batch("/r/z", &[], &[]));
+        let tree = b.finish(false);
+
+        assert_eq!(tree.nodes.len(), 4, "no node created twice");
+        let r = tree.root_report(10);
+        assert_eq!(r.total_size, 8);
+        assert_eq!(r.total_files, 3);
+        assert_eq!(r.total_dirs, 3);
+        assert_eq!(r.children[0].path, root.join("p"));
+        assert_eq!(r.children[0].size, 7);
+        let q = tree.report(&root.join("p").join("q"), 10).unwrap();
+        assert_eq!(q.top_files[0].path, root.join("p").join("q").join("a.TXT"));
+        // Extensions are folded to lower case.
+        let s = tree.file_stats(&root).unwrap();
+        assert_eq!(s.extensions[0].ext, "txt");
+        assert_eq!(s.extensions[0].count, 2);
     }
 }
