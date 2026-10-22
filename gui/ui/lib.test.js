@@ -117,12 +117,14 @@ test("pct rounds by magnitude and handles empty wholes", () => {
 test("mergeSettings keeps valid values and repairs the rest", () => {
   assert.deepEqual(lib.mergeSettings(null), lib.DEFAULT_SETTINGS);
   const s = lib.mergeSettings({
-    top: 5000, parallel: 0, max_depth: 3, trash: false, presets: ["node", "nope"],
+    version: 2, top: 5000, parallel: 0, max_depth: 3, trash: false, presets: ["node", "nope"],
     custom: [{ pattern: " *.iso " }, { pattern: "", on: true }, { pattern: "x", on: false }, null],
-    window_size: "8k", language: "de", bogus: 1,
+    window_size: "8k", language: "de", bogus: 1, engine: "gentle", keep_snapshots: 0,
   });
   assert.equal(s.top, 1000);
   assert.equal(s.parallel, 1);
+  assert.equal(s.engine, "gentle");
+  assert.equal(s.keep_snapshots, 1);
   assert.equal(s.max_depth, 3);
   assert.equal(s.trash, false);
   assert.deepEqual(s.presets, ["node"]);
@@ -133,6 +135,10 @@ test("mergeSettings keeps valid values and repairs the rest", () => {
   // The defaults themselves are never shared or mutated.
   s.presets.push("rust");
   assert.deepEqual(lib.DEFAULT_SETTINGS.presets, []);
+  // Settings saved before version 2 drop the old "2 at once" default.
+  assert.equal(lib.mergeSettings({ parallel: 2 }).parallel, lib.DEFAULT_SETTINGS.parallel);
+  assert.equal(lib.mergeSettings({ version: 2, parallel: 2 }).parallel, 2);
+  assert.equal(lib.mergeSettings({ engine: "turbo" }).engine, "fast");
 });
 
 test("activeExcludes unions templates and custom patterns", () => {
@@ -172,12 +178,28 @@ test("bucketLabel names open and closed ranges", () => {
 
 test("jobsToStart fills free slots oldest first", () => {
   const jobs = [
-    { id: 1, state: "done" }, { id: 2, state: "running" },
-    { id: 3, state: "queued" }, { id: 4, state: "queued" }, { id: 5, state: "queued" },
+    { id: 1, state: "done", root: "C:\\" }, { id: 2, state: "running", root: "C:\\" },
+    { id: 3, state: "queued", root: "C:\\a" }, { id: 4, state: "queued", root: "C:\\b" }, { id: 5, state: "queued", root: "C:\\c" },
   ];
   assert.deepEqual(lib.jobsToStart(jobs, 3).map((j) => j.id), [3, 4]);
   assert.deepEqual(lib.jobsToStart(jobs, 1), []);
   assert.deepEqual(lib.jobsToStart([], 2), []);
+});
+
+test("jobsToStart prefers drives nothing is reading", () => {
+  // "Scan all drives" while C: is busy: D: and G: start before more C: work.
+  const jobs = [
+    { id: 1, state: "running", root: "C:\\" },
+    { id: 2, state: "queued", root: "C:\\Users" },
+    { id: 3, state: "queued", root: "D:\\" },
+    { id: 4, state: "queued", root: "g:\\Games" },
+    { id: 5, state: "queued", root: "D:\\x" },
+  ];
+  assert.deepEqual(lib.jobsToStart(jobs, 3).map((j) => j.id), [3, 4]);
+  assert.deepEqual(lib.jobsToStart(jobs, 5).map((j) => j.id), [3, 4, 2, 5]);
+  assert.equal(lib.driveKey("c:\\x"), "c:");
+  assert.equal(lib.driveKey("/home/me"), "/");
+  assert.equal(lib.driveKey("\\\\srv\\share\\x"), "\\\\srv\\share");
 });
 
 test("mapItems adds direct files and unlisted folders so areas add up", () => {

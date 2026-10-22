@@ -81,7 +81,8 @@ enum Command {
         top: usize,
         #[command(flatten)]
         walk: WalkArgs,
-        /// Save the scan as a snapshot (JSON) for a later `--since` or `diff`.
+        /// Save the scan as a snapshot (every folder and file, compressed) for a
+        /// later `--since` or `diff`.
         #[arg(long, value_name = "FILE")]
         save: Option<PathBuf>,
         /// Compare against a snapshot saved earlier: what grew, shrank,
@@ -145,6 +146,10 @@ struct WalkArgs {
     /// Follow symbolic links / junctions.
     #[arg(long)]
     follow_symlinks: bool,
+    /// Threads listing directories (default: twice the CPU cores; 2-4 suits a
+    /// spinning disk).
+    #[arg(long)]
+    threads: Option<usize>,
 }
 
 impl WalkArgs {
@@ -153,6 +158,7 @@ impl WalkArgs {
             max_depth: self.max_depth,
             follow_symlinks: self.follow_symlinks,
             exclude: self.exclude.clone(),
+            threads: self.threads,
         }
     }
 }
@@ -207,7 +213,7 @@ fn main() -> ExitCode {
             let tree = with_progress(|p| ScanTree::build(&path, &opts, p));
             let elapsed = started.elapsed();
             let report = tree.root_report(top);
-            let snapshot = (old.is_some() || save.is_some()).then(|| Snapshot::capture(&tree, top));
+            let snapshot = (old.is_some() || save.is_some()).then(|| Snapshot::capture(&tree));
             let changes = match (&old, &snapshot) {
                 (Some(old), Some(new)) => match diff(old, new, &report.root) {
                     Ok(mut d) => {

@@ -79,7 +79,7 @@ html, body {
 .topbar {
   grid-column: 1 / -1; display: flex; align-items: center; gap: 14px;
   padding: 14px 22px; border-bottom: 1px solid var(--border-2);
-  background: color-mix(in srgb, var(--panel) 70%, transparent); backdrop-filter: blur(8px);
+  background: var(--panel);
 }
 .brand {
   font-size: 24px; font-weight: 800; white-space: nowrap; width: 276px;
@@ -87,6 +87,7 @@ html, body {
   -webkit-background-clip: text; background-clip: text; color: transparent;
 }
 .brand .ghost { -webkit-text-fill-color: initial; }
+.brand .ver { font-size: 12px; font-weight: 600; -webkit-text-fill-color: var(--muted); letter-spacing: .3px; vertical-align: 3px; }
 .pathbox { flex: 1; display: flex; gap: 10px; min-width: 0; }
 #path {
   flex: 1; min-width: 120px; padding: 10px 14px; background: var(--panel);
@@ -100,12 +101,13 @@ html, body {
   display: flex; flex-direction: column; gap: 18px; padding: 18px 14px 18px 22px;
   overflow-y: auto; border-right: 1px solid var(--border-2);
 }
-main { overflow: auto; padding: 18px 22px; outline: none; min-width: 0; }
+main { overflow: auto; padding: 18px 22px; outline: none; min-width: 0; transition: opacity .12s; }
+main.busy { opacity: .6; cursor: progress; }
 
 .statusbar {
   grid-column: 1 / -1; display: flex; justify-content: space-between; gap: 20px;
   padding: 6px 22px; font-size: 12.5px; color: var(--muted);
-  border-top: 1px solid var(--border-2); background: color-mix(in srgb, var(--panel) 70%, transparent);
+  border-top: 1px solid var(--border-2); background: var(--panel);
   min-height: 30px;
 }
 #status { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -195,9 +197,11 @@ h2 { margin: 0; font-size: 13px; color: var(--muted); text-transform: uppercase;
 
 /* ------------------------------ scan view ------------------------------ */
 .view {
-  display: grid; gap: 16px; min-height: 100%;
+  /* A fixed height lets the rows share the window instead of growing with
+     their content; long lists scroll inside their own card. */
+  display: grid; gap: 16px; height: 100%;
   grid-template-columns: minmax(0, 1fr) minmax(340px, 0.42fr);
-  grid-template-rows: auto auto minmax(420px, 1.3fr) minmax(360px, 1fr);
+  grid-template-rows: auto auto minmax(380px, 1.3fr) minmax(300px, 1fr);
 }
 .view > .full { grid-column: 1 / -1; }
 .viewhead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
@@ -349,14 +353,14 @@ tr.added .delta { color: var(--accent-2); text-transform: uppercase; font-weight
 /* ------------------------------ overlays ------------------------------ */
 .dropzone {
   position: fixed; inset: 0; z-index: 50; display: none; place-items: center;
-  background: color-mix(in srgb, var(--bg) 70%, transparent); backdrop-filter: blur(3px);
+  background: color-mix(in srgb, var(--bg) 80%, transparent);
 }
 .dropzone.show { display: grid; }
 .dropcard { padding: 40px 60px; border: 3px dashed var(--accent); border-radius: 24px; background: var(--panel); font-size: 22px; font-weight: 700; text-align: center; box-shadow: var(--shadow); }
 .dropicon { font-size: 54px; }
 
 .tooltip {
-  position: fixed; z-index: 60; pointer-events: none; display: none; max-width: 460px;
+  position: fixed; left: 0; top: 0; z-index: 60; pointer-events: none; display: none; max-width: 460px; will-change: transform;
   background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow);
   padding: 9px 12px; font-size: 12.5px; color: var(--text-2);
 }
@@ -371,7 +375,7 @@ tr.added .delta { color: var(--accent-2); text-transform: uppercase; font-weight
   background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 18px; box-shadow: var(--shadow);
 }
 .dlg.small { width: min(560px, calc(100vw - 60px)); }
-.dlg::backdrop { background: rgba(0, 0, 0, .55); backdrop-filter: blur(2px); }
+.dlg::backdrop { background: rgba(0, 0, 0, .6); }
 .dlg-in { display: flex; flex-direction: column; max-height: calc(100vh - 80px); }
 .dlg-head { display: flex; align-items: center; justify-content: space-between; padding: 18px 22px; border-bottom: 1px solid var(--border-2); }
 .dlg-head h2 { font-size: 16px; color: var(--text); text-transform: none; letter-spacing: 0; }

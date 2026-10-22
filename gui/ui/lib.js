@@ -165,13 +165,19 @@
     { id: "macos", patterns: [".DS_Store", ".Trash", ".Spotlight-V100", ".fseventsd"] },
   ];
 
+  // Bumped when a default changes in a way saved settings should pick up.
+  const SETTINGS_VERSION = 2;
+
   const DEFAULT_SETTINGS = {
+    version: SETTINGS_VERSION,
     top: 50, // folders / files listed per view
     min_mb: 1, // duplicate search ignores smaller files
     max_depth: null,
     follow_symlinks: false,
     trash: true, // delete -> Recycle Bin
-    parallel: 2, // scans running at once; the rest wait in the queue
+    parallel: 4, // scans running at once; the rest wait in the queue
+    engine: "fast", // "fast" (SSD/NVMe, many threads) | "gentle" (HDD / background)
+    keep_snapshots: 10, // snapshots kept per scanned folder
     presets: [], // enabled exclude template ids
     preset_off: [], // "id:pattern" switched off inside an enabled template
     custom: [], // [{ pattern, on }]
@@ -188,7 +194,10 @@
     s.top = int(saved.top, 1, 1000, s.top);
     s.min_mb = int(saved.min_mb, 0, 1_000_000, s.min_mb);
     s.max_depth = saved.max_depth == null ? null : int(saved.max_depth, 1, 100, null);
-    s.parallel = int(saved.parallel, 1, 8, s.parallel);
+    // Before version 2 at most 2 scans ran at once; that default is gone.
+    if (saved.version >= 2) s.parallel = int(saved.parallel, 1, 8, s.parallel);
+    s.keep_snapshots = int(saved.keep_snapshots, 1, 100, s.keep_snapshots);
+    if (["fast", "gentle"].includes(saved.engine)) s.engine = saved.engine;
     if (typeof saved.follow_symlinks === "boolean") s.follow_symlinks = saved.follow_symlinks;
     if (typeof saved.trash === "boolean") s.trash = saved.trash;
     const ids = new Set(EXCLUDE_PRESETS.map((p) => p.id));
@@ -264,12 +273,35 @@
     return `${short(lo)} – ${short(hi)}`;
   }
 
-  // Which queued jobs may start now, oldest first, so that no more than
-  // `maxParallel` jobs run at once.
+  // The drive a path lives on ("c:", "\\server\share", "/"), for scheduling.
+  function driveKey(path) {
+    const p = String(path);
+    const m = p.match(/^([A-Za-z]:)/);
+    if (m) return m[1].toLowerCase();
+    if (p.startsWith("\\\\")) return crumbs(p)[0].target.toLowerCase();
+    return "/";
+  }
+
+  // Which queued jobs may start now so that no more than `maxParallel` run at
+  // once. Jobs on a drive nothing is reading yet go first (oldest first among
+  // them): different disks scan in parallel for free, the same disk shares
+  // its bandwidth.
   function jobsToStart(jobs, maxParallel) {
-    const running = jobs.filter((j) => j.state === "running").length;
-    const free = Math.max(0, maxParallel - running);
-    return jobs.filter((j) => j.state === "queued").slice(0, free);
+    const running = jobs.filter((j) => j.state === "running");
+    let free = Math.max(0, maxParallel - running.length);
+    const busy = new Set(running.map((j) => driveKey(j.root)));
+    const queued = jobs.filter((j) => j.state === "queued");
+    const out = [];
+    for (const idleFirst of [true, false]) {
+      for (const j of queued) {
+        if (!free || out.includes(j)) continue;
+        if (idleFirst && busy.has(driveKey(j.root))) continue;
+        out.push(j);
+        busy.add(driveKey(j.root));
+        free--;
+      }
+    }
+    return out;
   }
 
   // The tiles of one map level: real folders plus, so the areas add up to the
@@ -306,6 +338,6 @@
   return {
     human, humanDelta, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
     pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
-    categorize, bucketLabel, jobsToStart, mapItems, parentPath, isUnder,
+    categorize, bucketLabel, jobsToStart, driveKey, mapItems, parentPath, isUnder, SETTINGS_VERSION,
   };
 });

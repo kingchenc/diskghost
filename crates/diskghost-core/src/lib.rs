@@ -18,9 +18,11 @@
 
 mod snapshot;
 mod tree;
+mod walk;
 
 pub use snapshot::{
-    diff, format_timestamp, DiffReport, DirDelta, Snapshot, SnapshotError, SNAPSHOT_FORMAT,
+    diff, format_timestamp, DiffReport, DirDelta, FileDelta, Snapshot, SnapshotError,
+    DIFF_FILE_LIMIT, SNAPSHOT_FORMAT,
 };
 pub use tree::ScanTree;
 
@@ -40,8 +42,12 @@ pub struct Options {
     /// Follow symbolic links / junctions (default `false` — avoids loops + surprises).
     pub follow_symlinks: bool,
     /// Glob patterns; a path is skipped if the glob matches the whole path, any
-    /// path component, or the file name (so `node_modules` and `*.tmp` both work).
+    /// path component below the walked root, or the file name (so
+    /// `node_modules` and `*.tmp` both work).
     pub exclude: Vec<String>,
+    /// Threads listing directories (`None` = twice the CPU cores, which keeps
+    /// SSDs busy; a spinning disk is better served by 2-4).
+    pub threads: Option<usize>,
 }
 
 /// Live progress + cancellation shared with a running scan / duplicate search.
@@ -217,14 +223,7 @@ pub struct RemoveReport {
 /// First N bytes hashed as a cheap pre-filter before a full-file hash.
 const PREFIX_LEN: usize = 4096;
 
-pub(crate) struct Walk {
-    pub(crate) files: Vec<FileEntry>,
-    /// Every directory below the root (the root itself is not listed).
-    pub(crate) dirs: Vec<PathBuf>,
-    pub(crate) skipped: u64,
-}
-
-fn build_globset(patterns: &[String]) -> globset::GlobSet {
+pub(crate) fn build_globset(patterns: &[String]) -> globset::GlobSet {
     let mut builder = globset::GlobSetBuilder::new();
     for p in patterns {
         if let Ok(g) = globset::Glob::new(p) {
@@ -247,15 +246,20 @@ pub fn validate_globs(patterns: &[String]) -> Vec<String> {
 }
 
 /// True if `path` should be excluded: the glob matches the whole path, any
-/// component (e.g. a `node_modules` dir), or the file name (e.g. `*.tmp`).
-fn is_excluded(glob: &globset::GlobSet, path: &Path) -> bool {
+/// component below `root` (e.g. a `node_modules` dir), or the file name (e.g.
+/// `*.tmp`). Components of `root` itself never count, so excluding `Users`
+/// still allows a scan of `C:\Users\me`.
+pub(crate) fn is_excluded(glob: &globset::GlobSet, root: &Path, path: &Path) -> bool {
     if glob.is_empty() {
         return false;
     }
     if glob.is_match(path) {
         return true;
     }
-    path.components().any(|c| glob.is_match(c.as_os_str()))
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .any(|c| glob.is_match(c.as_os_str()))
 }
 
 /// Bytes a file actually occupies on disk, as opposed to its logical length
@@ -265,7 +269,7 @@ fn is_excluded(glob: &globset::GlobSet, path: &Path) -> bool {
 /// metadata but store ~0 bytes locally. A disk-usage tool must count the real
 /// footprint, or a folder full of placeholders is reported wildly too large.
 #[cfg(windows)]
-fn on_disk_size(meta: &std::fs::Metadata, path: &Path) -> u64 {
+pub(crate) fn on_disk_size(meta: &std::fs::Metadata, path: &Path) -> u64 {
     use std::os::windows::fs::MetadataExt;
     // Only these attributes can make on-disk size diverge from the logical
     // length. For the overwhelmingly common normal file we skip the extra
@@ -327,100 +331,27 @@ fn compressed_size(path: &Path) -> Option<u64> {
 /// Bytes a file actually occupies on disk. On Unix `st_blocks` (512-byte units)
 /// reflects the real allocation, so sparse files and holes count correctly.
 #[cfg(unix)]
-fn on_disk_size(meta: &std::fs::Metadata, _path: &Path) -> u64 {
+pub(crate) fn on_disk_size(meta: &std::fs::Metadata, _path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     meta.blocks().saturating_mul(512)
 }
 
 /// Fallback for platforms without an allocation query: use the logical length.
 #[cfg(not(any(windows, unix)))]
-fn on_disk_size(meta: &std::fs::Metadata, _path: &Path) -> u64 {
+pub(crate) fn on_disk_size(meta: &std::fs::Metadata, _path: &Path) -> u64 {
     meta.len()
-}
-
-/// Walk `root` recursively in a single pass: collect files (with size), collect
-/// directories, and count unreadable entries, honouring [`Options`].
-pub(crate) fn walk(root: &Path, opts: &Options, progress: &Progress) -> Walk {
-    let glob = Arc::new(build_globset(&opts.exclude));
-
-    // Each file's size is cached in the entry's client_state (Some(size), or
-    // None if the stat failed) so it can be read on the parallel walk threads
-    // instead of one-at-a-time in the serial consumer below. This is the
-    // scan's hot path: statting hundreds of thousands of files serially was
-    // the whole cost; jwalk already walks in parallel, so we stat there too.
-    let mut wd = jwalk::WalkDirGeneric::<((), Option<(u64, u64)>)>::new(root)
-        .skip_hidden(false)
-        .follow_links(opts.follow_symlinks);
-    if let Some(d) = opts.max_depth {
-        wd = wd.max_depth(d);
-    }
-    let glob = glob.clone();
-    let wd = wd.process_read_dir(move |_depth, _path, _state, children| {
-        // Prune excluded entries *before* descending, so an excluded directory
-        // (e.g. node_modules) costs no I/O for its entire subtree.
-        if !glob.is_empty() {
-            children.retain(|res| match res {
-                Ok(e) => !is_excluded(&glob, &e.path()),
-                Err(_) => true,
-            });
-        }
-        // Stat every file here (on the walk's rayon worker), caching both its
-        // logical length and its real on-disk size as (logical, on_disk).
-        for e in children.iter_mut().flatten() {
-            if e.file_type().is_file() {
-                let p = e.path();
-                e.client_state = std::fs::metadata(&p)
-                    .ok()
-                    .map(|m| (m.len(), on_disk_size(&m, &p)));
-            }
-        }
-    });
-
-    let mut files = Vec::new();
-    let mut dirs = Vec::new();
-    let mut skipped = 0u64;
-
-    for entry in wd {
-        if progress.cancelled() {
-            break;
-        }
-        match entry {
-            Ok(e) => {
-                let ft = e.file_type();
-                if ft.is_dir() {
-                    if e.depth() > 0 {
-                        dirs.push(e.path()); // the root itself is not listed
-                    }
-                } else if ft.is_file() {
-                    match e.client_state {
-                        Some((logical, on_disk)) => {
-                            progress.files.fetch_add(1, Ordering::Relaxed);
-                            // Progress and totals track real on-disk bytes.
-                            progress.bytes.fetch_add(on_disk, Ordering::Relaxed);
-                            files.push(FileEntry {
-                                path: e.path(),
-                                size: on_disk,
-                                logical_size: logical,
-                            });
-                        }
-                        None => skipped += 1,
-                    }
-                }
-            }
-            Err(_) => skipped += 1,
-        }
-    }
-
-    Walk {
-        files,
-        dirs,
-        skipped,
-    }
 }
 
 /// Walk `root` recursively and return every file with its size (default options).
 pub fn walk_files(root: &Path) -> Vec<FileEntry> {
-    walk(root, &Options::default(), &Progress::default()).files
+    collect_files(root, &Options::default(), &Progress::default())
+}
+
+/// Every file below `root` (honouring `opts`), in no particular order.
+fn collect_files(root: &Path, opts: &Options, progress: &Progress) -> Vec<FileEntry> {
+    let mut files = Vec::new();
+    walk::walk(root, opts, progress, |b| files.extend(b.files));
+    files
 }
 
 /// Scan `root` with default options. See [`scan_with_progress`].
@@ -469,8 +400,7 @@ pub fn find_duplicates_with_progress(
 ) -> Vec<DupGroup> {
     // Duplicate detection groups by *logical* (content) size — two byte-identical
     // files are duplicates regardless of how they happen to be allocated on disk.
-    let files: Vec<FileEntry> = walk(root, opts, progress)
-        .files
+    let files: Vec<FileEntry> = collect_files(root, opts, progress)
         .into_iter()
         .filter(|f| f.logical_size >= min_size && f.logical_size > 0)
         .collect();
@@ -617,29 +547,24 @@ pub fn remove_path(
     let is_dir = top.as_ref().map(|m| m.is_dir()).unwrap_or(false);
 
     if is_dir {
-        // Enumerate the tree once (never following links). jwalk yields the root
-        // itself at depth 0, so `dirs` includes it and the deepest-first removal
-        // below takes the root down last.
-        for entry in jwalk::WalkDir::new(path)
-            .skip_hidden(false)
-            .follow_links(false)
-        {
-            if progress.cancelled() {
-                break;
+        // Enumerate the tree once (never following links). The root goes into
+        // `dirs` too, so the deepest-first removal below takes it down last.
+        // The listing shares the caller's cancel flag but not its counters,
+        // which count what is actually removed.
+        let listing = Progress {
+            cancel: progress.cancel.clone(),
+            ..Progress::default()
+        };
+        dirs.push(path.to_path_buf());
+        walk::walk(path, &Options::default(), &listing, |b| {
+            for f in b.files {
+                bytes = bytes.saturating_add(f.size);
+                files.push(f.path);
             }
-            // Unreadable entries (Err) are simply skipped.
-            if let Ok(e) = entry {
-                if e.file_type().is_dir() {
-                    dirs.push(e.path());
-                } else {
-                    let p = e.path();
-                    if let Ok(m) = e.metadata() {
-                        bytes = bytes.saturating_add(on_disk_size(&m, &p));
-                    }
-                    files.push(p);
-                }
-            }
-        }
+            dirs.extend(b.subdirs);
+            // Links and junctions are removed as entries, never followed.
+            files.extend(b.others);
+        });
     } else {
         // A single file (or a symlink): remove just that entry.
         if let Ok(m) = &top {
@@ -673,7 +598,7 @@ pub fn remove_path(
         RemoveMode::Delete => {
             // Unlink files in parallel. `remove_file` handles files and file/dir
             // symlinks on Unix; the `remove_dir` fallback covers Windows dir
-            // junctions that jwalk reported as non-dir entries.
+            // junctions, which the walk reports as entries, not directories.
             let file_errors: Vec<String> = files
                 .par_iter()
                 .filter_map(|f| {
@@ -1102,7 +1027,7 @@ mod tests {
         assert_eq!(rep.files, 3);
         // Freed bytes are on-disk (block-rounded on some filesystems).
         assert!(rep.bytes >= 1700, "freed bytes {}", rep.bytes);
-        assert!(rep.dirs >= 2); // root + a + a/b (root counted by jwalk)
+        assert_eq!(rep.dirs, 3); // root + a + a/b
         assert!(rep.errors.is_empty());
         assert!(d.exists()); // nothing was touched
         std::fs::remove_dir_all(&d).ok();

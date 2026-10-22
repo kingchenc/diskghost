@@ -9,7 +9,6 @@ rust-version.workspace = true
 description = "Fast parallel disk scanning and duplicate detection — the engine behind Diskghost."
 
 [dependencies]
-jwalk = "0.8"
 rayon = "1"
 blake3 = { version = "1", features = ["mmap"] }
 same-file = "1"
@@ -18,6 +17,7 @@ trash = "5"
 fs4 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+zstd = "0.14"
 
 [dev-dependencies]
 criterion = "0.5"
