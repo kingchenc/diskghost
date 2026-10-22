@@ -38,6 +38,7 @@ const APP_TIMEOUT: Duration = Duration::from_secs(20);
 /// The app gives up when the helper has not touched `beat` for this long.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the user has to answer the consent prompt.
+#[cfg(windows)]
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Serialize, Deserialize)]
@@ -171,6 +172,7 @@ pub struct Helper {
 }
 
 /// A random token: hashes keyed by the OS random source.
+#[cfg(windows)]
 fn random_token() -> String {
     use std::hash::{BuildHasher, Hasher};
     let part = || {

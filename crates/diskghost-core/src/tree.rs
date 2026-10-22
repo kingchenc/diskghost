@@ -615,8 +615,7 @@ impl ScanTree {
             }
         }
         let mut top: Vec<(u64, usize, usize)> = heap.into_iter().map(|Reverse(x)| x).collect();
-        top.sort_by_key(|x| Reverse(x.0));
-        let top_files = top
+        let mut top_files: Vec<FileEntry> = top
             .into_iter()
             .map(|(_, i, j)| {
                 let f = &self.nodes[i].files[j];
@@ -627,6 +626,8 @@ impl ScanTree {
                 }
             })
             .collect();
+        // Biggest first; equal sizes by path, so the list never reshuffles.
+        top_files.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
 
         ScanReport {
             root: base,
