@@ -683,33 +683,63 @@ function estimate(j) {
   return used > 0 ? Math.min(0.99, j.bytes / used) : null;
 }
 
-function progressMeter(j) {
-  const est = estimate(j);
-  if (est == null) return el("span", { class: "meter indeterminate" }, el("span", { class: "used" }));
-  return el("span", { class: "meter" }, el("span", { class: "used", style: { width: `${est * 100}%` } }));
+// Sidebar rows are created once per job and then only updated in place:
+// progress repaints them several times a second, and replacing the element
+// under the pointer between mouse-down and mouse-up swallows the click.
+const jobRows = new Map(); // job id -> { row, icon, name, close, sub, meter }
+
+function jobRow(j) {
+  let r = jobRows.get(j.id);
+  if (r) return r;
+  const id = j.id;
+  r = {
+    icon: el("span", { class: "jicon" }),
+    name: el("span", { class: "jname" }),
+    close: el("button", {
+      type: "button", class: "jclose",
+      onclick: (e) => {
+        e.stopPropagation();
+        const job = byId(id);
+        if (job) job.state === "running" ? cancelJob(job) : closeJob(job);
+      },
+    }),
+    sub: el("span", { class: "jsub" }),
+    meter: el("span", { class: "meter" }, el("span", { class: "used" })),
+  };
+  r.row = el("div", {
+    role: "button", tabindex: "0",
+    onclick: () => selectJob(id),
+    onkeydown: (e) => { if (e.key === "Enter") selectJob(id); },
+  }, r.icon, r.name, r.close, r.sub, r.meter);
+  jobRows.set(id, r);
+  return r;
+}
+
+// Set a property only when it changes, so unchanged rows cost nothing.
+function put(node, key, value) {
+  if (node[key] !== value) node[key] = value;
 }
 
 function renderJobs() {
   const box = $("jobs");
-  box.replaceChildren(...jobs.map((j) => {
+  for (const id of jobRows.keys()) if (!byId(id)) jobRows.delete(id);
+  jobs.forEach((j, i) => {
+    const r = jobRow(j);
     const busy = j.state === "running";
-    const closeBtn = el("button", {
-      type: "button", class: "jclose", title: busy ? t("cancel") : t("close"),
-      onclick: (e) => { e.stopPropagation(); busy ? cancelJob(j) : closeJob(j); },
-    }, busy ? "⏹" : "✕");
-    const row = el("div", {
-      class: `job ${j.state}${j.id === activeId ? " active" : ""}`, role: "button", tabindex: "0",
-      onclick: () => selectJob(j.id),
-      onkeydown: (e) => { if (e.key === "Enter") selectJob(j.id); },
-    },
-    el("span", { class: "jicon", text: jobIcon(j) }),
-    el("span", { class: "jname", text: `${j.kind === "dupes" ? `${t("dupesIn")} ` : ""}${jobName(j)}` }),
-    closeBtn,
-    el("span", { class: "jsub", text: jobSub(j) }),
-    busy ? progressMeter(j) : null);
-    row.title = j.root;
-    return row;
-  }));
+    put(r.row, "className", `job ${j.state}${j.id === activeId ? " active" : ""}`);
+    put(r.row, "title", j.root);
+    put(r.icon, "textContent", jobIcon(j));
+    put(r.name, "textContent", `${j.kind === "dupes" ? `${t("dupesIn")} ` : ""}${jobName(j)}`);
+    put(r.close, "textContent", busy ? "⏹" : "✕");
+    put(r.close, "title", busy ? t("cancel") : t("close"));
+    put(r.sub, "textContent", jobSub(j));
+    const est = busy ? estimate(j) : null;
+    put(r.meter.style, "display", busy ? "" : "none");
+    put(r.meter, "className", est == null ? "meter indeterminate" : "meter");
+    put(r.meter.firstChild.style, "width", est == null ? "" : `${est * 100}%`);
+    if (box.children[i] !== r.row) box.insertBefore(r.row, box.children[i] || null);
+  });
+  while (box.children.length > jobs.length) box.lastChild.remove();
   $("btn-clear-done").disabled = !jobs.some((j) => ["done", "cancelled", "error"].includes(j.state));
 }
 
