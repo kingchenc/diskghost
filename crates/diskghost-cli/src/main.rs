@@ -4,7 +4,7 @@
 //! scripts and agents (headless use).
 
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use diskghost_core::{
     diff, find_duplicates_cached, format_timestamp, human_delta, human_size, phase, reclaim,
     remove_path, validate_globs, DiffReport, DupGroup, HashCache, Options, Progress, ReclaimAction,
-    RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot,
+    ReclaimReport, RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot,
 };
 use serde::Serialize;
 
@@ -59,14 +59,14 @@ fn with_progress<T>(job: impl FnOnce(&Progress) -> T) -> T {
     out
 }
 
-fn warn_invalid_globs(patterns: &[String]) {
+/// Refuse invalid exclude globs up front: skipping one would scan, or reclaim,
+/// exactly what the caller meant to leave out.
+fn check_globs(patterns: &[String]) -> bool {
     let bad = validate_globs(patterns);
     if !bad.is_empty() {
-        eprintln!(
-            "warning: ignoring invalid exclude glob(s): {}",
-            bad.join(", ")
-        );
+        eprintln!("error: invalid exclude glob(s): {}", bad.join(", "));
     }
+    bad.is_empty()
 }
 
 #[derive(Parser)]
@@ -222,7 +222,9 @@ fn main() -> ExitCode {
                 eprintln!("error: not a directory: {}", path.display());
                 return ExitCode::FAILURE;
             }
-            warn_invalid_globs(&walk.exclude);
+            if !check_globs(&walk.exclude) {
+                return ExitCode::FAILURE;
+            }
             let opts = walk.to_options();
             // Load the old snapshot before scanning, so a bad file fails fast.
             let old = match since.as_deref().map(Snapshot::load) {
@@ -251,12 +253,24 @@ fn main() -> ExitCode {
                 },
                 _ => None,
             };
+            // Save before printing, so a failure leaves stdout empty.
+            let saved = match (&save, &snapshot) {
+                (Some(file), Some(snap)) => {
+                    if let Err(e) = snap.save(file) {
+                        eprintln!("error: cannot save snapshot: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    Some(file.as_path())
+                }
+                _ => None,
+            };
             if cli.json {
                 let out = ScanOutput {
                     report: &report,
                     diff: changes.as_ref(),
                     engine: tree.engine(),
                     mft_fallback: tree.mft_fallback(),
+                    snapshot_saved: saved,
                 };
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {
@@ -274,14 +288,9 @@ fn main() -> ExitCode {
                 if let Some(why) = tree.mft_fallback() {
                     eprintln!("note: --mft not used: {why}");
                 }
-            }
-            if let (Some(file), Some(snap)) = (&save, &snapshot) {
-                if let Err(e) = snap.save(file) {
-                    eprintln!("error: cannot save snapshot: {e}");
-                    return ExitCode::FAILURE;
+                if let Some(file) = saved {
+                    eprintln!("snapshot saved to {}", file.display());
                 }
-                // Keep stdout clean for --json consumers.
-                eprintln!("snapshot saved to {}", file.display());
             }
         }
         Command::Diff { old, new, at, top } => {
@@ -319,24 +328,42 @@ fn main() -> ExitCode {
                 eprintln!("error: not a directory: {}", path.display());
                 return ExitCode::FAILURE;
             }
-            warn_invalid_globs(&walk.exclude);
+            if !check_globs(&walk.exclude) {
+                return ExitCode::FAILURE;
+            }
             let opts = walk.to_options();
             let hashes = cache.as_deref().map(HashCache::load).unwrap_or_default();
             let groups = with_progress(|p| {
                 find_duplicates_cached(&path, min_mb * 1024 * 1024, &opts, p, &hashes)
             });
+            // With --json, warnings go into the output instead of stderr.
+            let mut warnings = Vec::new();
             if let Some(file) = &cache {
                 if let Err(e) = hashes.save(file) {
-                    eprintln!("warning: cannot save hash cache: {e}");
+                    let w = format!("cannot save hash cache: {e}");
+                    if cli.json {
+                        warnings.push(w);
+                    } else {
+                        eprintln!("warning: {w}");
+                    }
                 }
             }
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&groups).unwrap());
-            } else {
+            if !cli.json {
                 print_dupes(&groups);
             }
-            if let Some(arg) = reclaim_arg {
-                run_reclaim(&groups, arg.into(), !apply);
+            let reclaimed = reclaim_arg.map(|arg| run_reclaim(&groups, arg.into(), !apply));
+            if cli.json {
+                let out = DupesOutput {
+                    groups: &groups,
+                    reclaim: reclaimed.as_ref(),
+                    warnings,
+                };
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else if let Some(r) = &reclaimed {
+                print_reclaim(r);
+            }
+            if reclaimed.is_some_and(|r| !r.errors.is_empty()) {
+                return ExitCode::FAILURE;
             }
         }
         Command::Rm { path, trash, apply } => {
@@ -391,6 +418,20 @@ struct ScanOutput<'a> {
     /// Why --mft was asked for but not used.
     #[serde(skip_serializing_if = "Option::is_none")]
     mft_fallback: Option<&'a str>,
+    /// Where `--save` wrote the snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_saved: Option<&'a Path>,
+}
+
+/// `dupes --json` output: the groups, plus `reclaim` when `--reclaim` was
+/// given and `warnings` for problems that did not stop the search.
+#[derive(Serialize)]
+struct DupesOutput<'a> {
+    groups: &'a [DupGroup],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reclaim: Option<&'a ReclaimReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 fn print_diff(d: &DiffReport) {
@@ -557,34 +598,42 @@ fn print_dupes(groups: &[DupGroup]) {
 }
 
 /// Reclaim space across all groups, keeping the first file of each group.
-fn run_reclaim(groups: &[DupGroup], action: ReclaimAction, dry_run: bool) {
-    let mut removed = 0usize;
-    let mut reclaimed = 0u64;
-    let mut errors = 0usize;
+fn run_reclaim(groups: &[DupGroup], action: ReclaimAction, dry_run: bool) -> ReclaimReport {
+    let mut total = ReclaimReport {
+        removed: 0,
+        reclaimed: 0,
+        errors: Vec::new(),
+        dry_run,
+    };
     for g in groups {
         if g.files.len() < 2 {
             continue;
         }
         let keep = &g.files[0];
         let report = reclaim(keep, &g.files[1..], g.size, action, dry_run);
-        removed += report.removed;
-        reclaimed += report.reclaimed;
-        errors += report.errors.len();
-        for e in &report.errors {
-            eprintln!("  ! {e}");
-        }
+        total.removed += report.removed;
+        total.reclaimed += report.reclaimed;
+        total.errors.extend(report.errors);
     }
-    let mode = if dry_run {
+    total
+}
+
+fn print_reclaim(r: &ReclaimReport) {
+    for e in &r.errors {
+        eprintln!("  ! {e}");
+    }
+    let mode = if r.dry_run {
         "DRY-RUN — nothing changed; pass --apply to act"
     } else {
         "applied"
     };
     print!(
-        "\nReclaim [{mode}]: {removed} file(s), {} reclaimable",
-        human_size(reclaimed)
+        "\nReclaim [{mode}]: {} file(s), {} reclaimable",
+        r.removed,
+        human_size(r.reclaimed)
     );
-    if errors > 0 {
-        print!(", {errors} error(s)");
+    if !r.errors.is_empty() {
+        print!(", {} error(s)", r.errors.len());
     }
     println!();
 }
