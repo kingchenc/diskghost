@@ -72,7 +72,7 @@ cargo install --path crates/diskghost-cli
 # Biggest sub-folders and files
 diskghost scan "C:\Users\me\Desktop" --top 20
 
-# Scan options
+# Scan options (an invalid exclude glob is an error, never silently skipped)
 diskghost scan . --exclude node_modules --exclude "*.tmp" --max-depth 3 --follow-symlinks
 
 # Duplicates (ignore anything under 5 MB)
@@ -109,10 +109,21 @@ Add `--json` to any command for machine-readable output:
 
 ```bash
 diskghost scan . --json          # total_size, children, top_files, root_files, skipped, cancelled …
-diskghost dupes . --min-mb 10 --json   # duplicate groups with reclaimable bytes
+diskghost scan . --save last.dgs --json    # ...plus "snapshot_saved": the file written
+diskghost dupes . --min-mb 10 --json   # {"groups": [...]}: duplicate groups with reclaimable bytes
+diskghost dupes . --reclaim trash --json   # ...plus "reclaim": removed, reclaimed, errors, dry_run
 diskghost scan . --since old.json --json   # the report plus a "diff" object (grown/shrunk/added/removed)
 diskghost diff old.json new.json --json    # just the diff
 ```
+
+With `--json`, a successful run writes exactly one JSON document to stdout
+and nothing to stderr (apart from the live progress line when stderr is a
+terminal): notices and warnings are fields of the JSON
+(`snapshot_saved`, `mft_fallback`, `warnings`), so the output stays valid
+even when stdout and stderr end up in the same file (`2>&1`). Errors go to
+stderr with a non-zero exit code and leave stdout empty; only `rm` and
+`dupes --reclaim` still print their report when some files could not be
+removed, with the failures in its `errors`.
 
 Perfect for wiring into an automation/agent that decides what to clean.
 

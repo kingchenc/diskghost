@@ -39,7 +39,7 @@ fn scan_json_is_valid() {
 }
 
 #[test]
-fn dupes_json_is_array() {
+fn dupes_json_has_groups() {
     let out = Command::new(bin())
         .args(["dupes", sample_dir(), "--min-mb", "999999", "--json"])
         .output()
@@ -47,7 +47,8 @@ fn dupes_json_is_array() {
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
-    assert!(v.is_array());
+    assert!(v["groups"].as_array().unwrap().is_empty());
+    assert!(v.get("reclaim").is_none() && v.get("warnings").is_none());
 }
 
 #[test]
@@ -196,6 +197,177 @@ fn scan_save_then_since_and_diff() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("nothing changed"));
 
     std::fs::remove_dir_all(&d).ok();
+}
+
+/// A successful `--json` run writes one JSON document to stdout and nothing to
+/// stderr, so the output stays valid even when both streams are merged.
+fn json_only(out: &std::process::Output) -> serde_json::Value {
+    assert!(out.status.success(), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.is_empty(), "stderr should be empty:\n{err}");
+    serde_json::from_slice(&out.stdout).expect("stdout is pure JSON")
+}
+
+#[test]
+fn scan_json_save_reports_in_json() {
+    let d = scratch("jsonsave");
+    let data = d.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("a.bin"), [0u8; 100]).unwrap();
+    let snap = d.join("snap.json");
+
+    let out = Command::new(bin())
+        .args([
+            "scan",
+            data.to_str().unwrap(),
+            "--json",
+            "--save",
+            snap.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run diskghost");
+    let v = json_only(&out);
+    assert!(snap.is_file(), "snapshot file should exist");
+    assert!(v.get("total_size").is_some());
+    assert_eq!(v["snapshot_saved"].as_str(), snap.to_str());
+
+    // Without --save there is no such key.
+    let out = Command::new(bin())
+        .args(["scan", data.to_str().unwrap(), "--json"])
+        .output()
+        .expect("run diskghost");
+    assert!(json_only(&out).get("snapshot_saved").is_none());
+
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn scan_json_save_failure_leaves_stdout_empty() {
+    let d = scratch("jsonsavefail");
+    // A directory where the snapshot file should go cannot be overwritten.
+    let taken = d.join("taken");
+    std::fs::create_dir_all(&taken).unwrap();
+
+    let out = Command::new(bin())
+        .args([
+            "scan",
+            sample_dir(),
+            "--json",
+            "--save",
+            taken.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run diskghost");
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot save snapshot"));
+
+    std::fs::remove_dir_all(&d).ok();
+}
+
+/// Three copies of one file plus a unique one, under a fresh scratch dir.
+fn dupes_fixture(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let d = scratch(label);
+    let data = d.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    for name in ["a.bin", "b.bin", "c.bin"] {
+        std::fs::write(data.join(name), [7u8; 50_000]).unwrap();
+    }
+    std::fs::write(data.join("unique.bin"), [9u8; 50_000]).unwrap();
+    (d, data)
+}
+
+#[test]
+fn dupes_json_reclaim_reports_in_json() {
+    let (d, data) = dupes_fixture("jsonreclaim");
+
+    let out = Command::new(bin())
+        .args([
+            "dupes",
+            data.to_str().unwrap(),
+            "--min-mb",
+            "0",
+            "--reclaim",
+            "delete",
+            "--json",
+        ])
+        .output()
+        .expect("run diskghost");
+    let v = json_only(&out);
+    let groups = v["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["files"].as_array().unwrap().len(), 3);
+    let r = &v["reclaim"];
+    assert_eq!(r["dry_run"], true);
+    assert_eq!(r["removed"], 2);
+    assert_eq!(r["reclaimed"], 100_000);
+    assert!(r["errors"].as_array().unwrap().is_empty());
+    // A dry run changes nothing.
+    for name in ["a.bin", "b.bin", "c.bin", "unique.bin"] {
+        assert!(data.join(name).is_file(), "{name} should still exist");
+    }
+
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn dupes_json_cache_warning_goes_into_json() {
+    let (d, data) = dupes_fixture("jsonwarn");
+    // A directory where the cache file should go cannot be overwritten.
+    let taken = d.join("taken");
+    std::fs::create_dir_all(&taken).unwrap();
+
+    let out = Command::new(bin())
+        .args([
+            "dupes",
+            data.to_str().unwrap(),
+            "--min-mb",
+            "0",
+            "--cache",
+            taken.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run diskghost");
+    let v = json_only(&out);
+    assert_eq!(v["groups"].as_array().unwrap().len(), 1);
+    let warnings = v["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0]
+        .as_str()
+        .unwrap()
+        .starts_with("cannot save hash cache"));
+
+    // Without --json the warning stays on stderr.
+    let out = Command::new(bin())
+        .args([
+            "dupes",
+            data.to_str().unwrap(),
+            "--min-mb",
+            "0",
+            "--cache",
+            taken.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run diskghost");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("warning: cannot save hash cache"));
+
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn invalid_exclude_glob_fails() {
+    for cmd in ["scan", "dupes"] {
+        let out = Command::new(bin())
+            .args([cmd, sample_dir(), "--exclude", "a[", "--json"])
+            .output()
+            .expect("run diskghost");
+        assert!(!out.status.success(), "{cmd} should fail");
+        assert!(out.stdout.is_empty(), "{cmd}: {out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("invalid exclude glob(s): a["), "{cmd}: {err}");
+    }
 }
 
 #[test]
