@@ -6,6 +6,8 @@
 node_modules/
 dist/
 src-tauri/target/
+# The CLI sidecar, built by gui/src-tauri/scripts/build-cli.mjs
+gui/src-tauri/binaries/
 
 # OS / editor cruft
 .DS_Store

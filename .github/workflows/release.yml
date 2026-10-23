@@ -112,11 +112,15 @@ jobs:
             libgtk-3-dev
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "gui/src-tauri -> target"
+          workspaces: |
+            gui/src-tauri -> target
+            . -> target
 
       - name: Install tauri-cli
         run: cargo install tauri-cli --version "^2.0" --locked
 
+      # beforeBuildCommand builds the CLI for the same target first; every
+      # bundle carries it (bundle.externalBin).
       - name: Build GUI bundles
         working-directory: gui/src-tauri
         run: cargo tauri build ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
