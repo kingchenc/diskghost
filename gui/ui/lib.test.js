@@ -276,3 +276,18 @@ test("protectedExcludes covers the protected folders and program file types", ()
   assert.equal(new Set(ex).size, ex.length);
   assert.equal(lib.mergeSettings({ engine: "mft" }).engine, "mft");
 });
+
+test("dropReclaimed removes handled copies and finished groups", () => {
+  const groups = [
+    { hash: "a", size: 10, files: ["/k/a", "/x/a", "/y/a"], wasted: 20 },
+    { hash: "b", size: 5, files: ["/k/b", "/x/b"], wasted: 5 },
+    { hash: "c", size: 7, files: ["/k/c", "/x/c"], wasted: 7 },
+  ];
+  const left = lib.dropReclaimed(groups, ["/x/a", "/x/b"]);
+  assert.deepEqual(left.map((g) => [g.hash, g.files, g.wasted]), [
+    ["a", ["/k/a", "/y/a"], 10],
+    ["c", ["/k/c", "/x/c"], 7],
+  ]);
+  assert.equal(groups[0].files.length, 3); // the input is not modified
+  assert.deepEqual(lib.dropReclaimed(groups, []).length, 3);
+});

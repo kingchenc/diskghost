@@ -320,6 +320,19 @@
     return [...sets.values()].sort((a, b) => b.wasted - a.wasted || a.key.localeCompare(b.key));
   }
 
+  // Duplicate groups after a reclaim: the copies in `done` are gone (or are
+  // hard links now), groups left with one file are no duplicates any more,
+  // and what each group wastes is counted again.
+  function dropReclaimed(groups, done) {
+    const gone = new Set(done || []);
+    return (groups || [])
+      .map((g) => {
+        const files = g.files.filter((f) => !gone.has(f));
+        return { ...g, files, wasted: g.size * Math.max(0, files.length - 1) };
+      })
+      .filter((g) => g.files.length > 1);
+  }
+
   // The drive a path lives on ("c:", "\\server\share", "/"), for scheduling.
   function driveKey(path) {
     const p = String(path);
@@ -386,6 +399,6 @@
     human, humanDelta, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
     pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
     categorize, bucketLabel, jobsToStart, driveKey, mapItems, parentPath, isUnder, SETTINGS_VERSION,
-    isProtectedPath, folderSets, protectedExcludes,
+    isProtectedPath, folderSets, protectedExcludes, dropReclaimed,
   };
 });

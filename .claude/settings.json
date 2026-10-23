@@ -1,0 +1,7 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node \"D:\\Coding\\switchboard\\spike\\tools\\statusline.mjs\"",
+    "padding": 0
+  }
+}

@@ -89,6 +89,7 @@ const I18N = {
     confirmTrash: "Move to the Recycle Bin?", confirmDelete: "Delete permanently?",
     confirmDeleteWarn: "This cannot be undone.", ok: "OK",
     reclaimConfirm: (a, n) => `${a}: ${n} file(s)?`, irreversible: "This cannot be undone.",
+    toTrashNote: "(moved to the Recycle Bin — the space is freed when it is emptied)",
     enterPath: "Enter a folder path first.",
     // categories
     cat_video: "Video", cat_image: "Images", cat_audio: "Audio", cat_archive: "Archives",
@@ -197,6 +198,7 @@ const I18N = {
     confirmTrash: "In den Papierkorb verschieben?", confirmDelete: "Endgültig löschen?",
     confirmDeleteWarn: "Das lässt sich nicht rückgängig machen.", ok: "OK",
     reclaimConfirm: (a, n) => `${a}: ${n} Datei(en)?`, irreversible: "Das lässt sich nicht rückgängig machen.",
+    toTrashNote: "(in den Papierkorb verschoben — der Platz wird frei, sobald er geleert wird)",
     enterPath: "Bitte zuerst einen Ordnerpfad eingeben.",
     cat_video: "Video", cat_image: "Bilder", cat_audio: "Audio", cat_archive: "Archive",
     cat_diskimage: "Disk-Images & VMs", cat_document: "Dokumente", cat_code: "Code & Textdaten",
@@ -1707,16 +1709,20 @@ async function reclaimShown(j, dryRun) {
   status(dryRun ? `${t("dryRun")}…` : t("deleting"));
   try {
     const rep = await invoke("reclaim_dupes", { jobs: reclaimJobs.map(({ keep, remove, size }) => ({ keep, remove, size })), action, dryRun });
-    status(`${rep.dry_run ? "DRY-RUN" : "OK"}: ${num(rep.removed)} ${t("files")}, ${human(rep.reclaimed)} ${t("reclaimable")}` +
-      (rep.errors.length ? `, ${rep.errors.length} ${t("errors")}` : ""), rep.errors.length > 0);
+    const where = action === "trash" ? ` ${t("toTrashNote")}` : "";
+    status(`${rep.dry_run ? "DRY-RUN" : "OK"}: ${num(rep.removed)} ${t("files")}, ${human(rep.reclaimed)} ${t("reclaimable")}${rep.dry_run ? "" : where}` +
+      (rep.errors.length ? `, ${rep.errors.length} ${t("errors")}: ${rep.errors[0]}` : ""), rep.errors.length > 0);
     if (!rep.dry_run) {
+      // Drop exactly the copies that were dealt with; stay in this view.
+      j.groups = dropReclaimed(j.groups, rep.done);
+      for (const [hash, kept] of j.keep) if (!j.groups.some((g) => g.hash === hash && g.files.includes(kept))) j.keep.delete(hash);
+      j.tagged = false;
       for (const o of jobs) {
         if (o.kind !== "scan" || !(isUnder(j.root, o.root) || isUnder(o.root, j.root))) continue;
-        o.cache.clear();
+        o.cache.clear(); // the backend took the files out of its tree
         o.stale = true;
       }
-      j.tagged = false;
-      rescan(j);
+      renderFor(j);
       loadDrives();
     }
   } catch (e) {

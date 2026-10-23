@@ -26,6 +26,18 @@ use crate::snapshot::{get_varint, put_varint};
 use crate::walk::walk;
 use crate::{phase, DupGroup, Options, Progress};
 
+/// Folders a duplicate search never enters (below its root): the recycle bin
+/// and trash of each platform, and Windows' restore-point store. Files there
+/// are copies of something that was just deleted, not duplicates to clean up.
+pub const TRASH_DIRS: [&str; 6] = [
+    "$Recycle.Bin",
+    "RECYCLER",
+    "System Volume Information",
+    ".Trash",
+    ".Trashes",
+    ".Trash-*",
+];
+
 /// Bytes read from each end of a candidate for the quick comparison.
 const SAMPLE: u64 = 16 * 1024;
 
@@ -298,6 +310,16 @@ pub(crate) fn find(
     cache: &HashCache,
 ) -> Vec<DupGroup> {
     // 1. Every file big enough; duplicates group by *logical* (content) size.
+    // Trash folders hold what was just reclaimed: never duplicates to act on.
+    let opts = &Options {
+        exclude: opts
+            .exclude
+            .iter()
+            .cloned()
+            .chain(TRASH_DIRS.iter().map(|d| d.to_string()))
+            .collect(),
+        ..opts.clone()
+    };
     let mut cands: Vec<Cand> = Vec::new();
     let _ = walk(root, opts, progress, |b| {
         for (f, modified) in b.files.into_iter().zip(b.modified) {
@@ -460,6 +482,41 @@ mod tests {
         assert_eq!(g[0].files, vec![d.join("a.bin"), d.join("b.bin")]);
         assert_eq!(g[0].wasted, 200_000);
         assert_eq!(cache.len(), 3);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn the_recycle_bin_is_not_searched() {
+        // A copy sent to the recycle bin must not reappear as a duplicate of
+        // the file that was kept.
+        let d = tmpdir("trash");
+        write(&d.join("keep/a.bin"), &[3u8; 50_000]);
+        write(
+            &d.join("$Recycle.Bin/S-1-5-21/$RABC123.bin"),
+            &[3u8; 50_000],
+        );
+        write(&d.join(".Trash-1000/files/a.bin"), &[3u8; 50_000]);
+        let g = find(
+            &d,
+            1,
+            &Options::default(),
+            &Progress::default(),
+            &HashCache::new(),
+        );
+        assert!(g.is_empty(), "{g:?}");
+        // Searching inside the trash itself still works.
+        write(
+            &d.join("$Recycle.Bin/S-1-5-21/$RDEF456.bin"),
+            &[3u8; 50_000],
+        );
+        let inside = find(
+            &d.join("$Recycle.Bin"),
+            1,
+            &Options::default(),
+            &Progress::default(),
+            &HashCache::new(),
+        );
+        assert_eq!(inside.len(), 1);
         std::fs::remove_dir_all(&d).ok();
     }
 

@@ -23,7 +23,7 @@ mod snapshot;
 mod tree;
 mod walk;
 
-pub use dupes::HashCache;
+pub use dupes::{HashCache, TRASH_DIRS};
 
 pub use snapshot::{
     diff, format_timestamp, DiffReport, DirDelta, FileDelta, Snapshot, SnapshotError,
