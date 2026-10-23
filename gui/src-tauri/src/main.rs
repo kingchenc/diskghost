@@ -595,7 +595,7 @@ async fn reclaim_dupes(
     jobs: Vec<ReclaimJob>,
     action: String,
     dry_run: bool,
-) -> Result<ReclaimReport, String> {
+) -> Result<ReclaimOutcome, String> {
     let act = match action.as_str() {
         "delete" => ReclaimAction::Delete,
         "trash" => ReclaimAction::Trash,
@@ -606,27 +606,46 @@ async fn reclaim_dupes(
         let mut removed = 0usize;
         let mut reclaimed = 0u64;
         let mut errors = Vec::new();
-        let mut touched = Vec::new();
+        let mut done = Vec::new();
+        // One path at a time, so the outcome of each is known exactly: the
+        // view drops just those copies instead of searching again.
         for j in jobs {
             let keep = PathBuf::from(&j.keep);
-            let remove: Vec<PathBuf> = j.remove.iter().map(PathBuf::from).collect();
-            let r = reclaim(&keep, &remove, j.size, act, dry_run);
-            removed += r.removed;
-            reclaimed += r.reclaimed;
-            errors.extend(r.errors);
-            touched.extend(remove);
+            for p in j.remove {
+                let path = PathBuf::from(&p);
+                let r = reclaim(&keep, std::slice::from_ref(&path), j.size, act, dry_run);
+                removed += r.removed;
+                reclaimed += r.reclaimed;
+                errors.extend(r.errors);
+                if r.removed > 0 {
+                    done.push(p);
+                }
+            }
         }
-        if !dry_run && removed > 0 {
-            forget_paths(&app, &touched);
+        if !dry_run && act != ReclaimAction::Hardlink {
+            let gone: Vec<PathBuf> = done.iter().map(PathBuf::from).collect();
+            forget_paths(&app, &gone);
         }
-        Ok(ReclaimReport {
-            removed,
-            reclaimed,
-            errors,
-            dry_run,
+        Ok(ReclaimOutcome {
+            report: ReclaimReport {
+                removed,
+                reclaimed,
+                errors,
+                dry_run,
+            },
+            done,
         })
     })
     .await
+}
+
+/// A reclaim's report plus the copies it actually dealt with.
+#[derive(Serialize)]
+struct ReclaimOutcome {
+    #[serde(flatten)]
+    report: ReclaimReport,
+    /// Paths deleted, sent to the trash or replaced by a hard link.
+    done: Vec<String>,
 }
 
 /// Remove a file or folder as job `job` — permanently or to the OS trash.
