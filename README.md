@@ -55,6 +55,19 @@ Find where your space went, hunt down byte-identical duplicates, and reclaim the
 
 ## Install
 
+The desktop app's installers bring the `diskghost` CLI along, so one install
+gives you both, and updating the app updates the CLI:
+
+- **Windows setup (`*-setup.exe`)**: the CLI sits next to the app and its
+  folder goes on your user PATH (removed again on uninstall). Open a new
+  terminal and `diskghost` works.
+- **Windows MSI**: the same, installed for all users, on the system PATH.
+- **Linux `.deb` / `.rpm`**: `/usr/bin/diskghost`.
+- **macOS `.dmg`, AppImage**: inside the app bundle, not on the PATH; use one of
+  the ways below.
+
+The CLI on its own:
+
 ```bash
 # Install the `diskghost` command globally, straight from GitHub (no crates.io):
 cargo install --git https://github.com/kingchenc/diskghost diskghost-cli
@@ -186,6 +199,10 @@ From `gui/src-tauri`:
 cargo tauri dev      # run the app
 cargo tauri build    # bundle an installer
 ```
+
+Both first build the CLI that the installers carry (`scripts/build-cli.mjs`,
+needs Node). A plain `cargo build` / `cargo clippy` here needs that file too:
+run `node scripts/build-cli.mjs` once before.
 
 ## Why it's fast — and correct
 

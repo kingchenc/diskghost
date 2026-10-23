@@ -16,6 +16,7 @@ use tauri::{Emitter, LogicalSize, Manager};
 use tauri_plugin_dialog::DialogExt;
 
 mod helper;
+mod path_env;
 
 /// Sub-folders shown inside each folder on the map's second level.
 const NESTED_PER_FOLDER: usize = 12;
@@ -948,6 +949,17 @@ fn main() {
     if args.len() == 4 && args[1] == "--mft-helper" {
         helper::serve(Path::new(&args[2]), &args[3]);
         return;
+    }
+    // Run by the Windows setup: the CLI next to the app goes on/off the PATH.
+    if args.len() == 2 && (args[1] == "--add-to-path" || args[1] == "--remove-from-path") {
+        let code = match path_env::update(args[1] == "--add-to-path") {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        };
+        std::process::exit(code);
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

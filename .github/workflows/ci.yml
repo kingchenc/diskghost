@@ -59,12 +59,19 @@ jobs:
             libgtk-3-dev
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "gui/src-tauri -> target"
-      - name: Clippy + build GUI
+          workspaces: |
+            gui/src-tauri -> target
+            . -> target
+      # The setup ships the CLI next to the app (bundle.externalBin); tauri-build
+      # wants that file before it builds anything.
+      - name: Build the CLI sidecar
+        run: node gui/src-tauri/scripts/build-cli.mjs
+      - name: Clippy + build + test GUI
         working-directory: gui/src-tauri
         run: |
           cargo clippy --all-targets -- -D warnings
           cargo build --release
+          cargo test --release
       # The UI's pure helpers (formatting, breadcrumbs, treemap layout, diff
       # indexing) are plain JS with Node unit tests; no npm install needed.
       - name: UI unit tests
