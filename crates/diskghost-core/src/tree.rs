@@ -15,6 +15,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
+use crate::snapshot::{ENTRY_DIR, ENTRY_FILE};
 use crate::walk::{walk, Batch, Engine};
 use crate::{
     disk_space, DirSize, ExtStat, FileEntry, FileStats, Options, Progress, ScanReport, SizeBucket,
@@ -44,6 +45,12 @@ pub(crate) struct Node {
     pub(crate) children: Vec<usize>,
     /// Files directly in this directory, sorted by name once the walk is done.
     pub(crate) files: Vec<FileRec>,
+    /// Whether this directory's own listing was read (it was not cut off by
+    /// the depth limit or a cancelled walk).
+    pub(crate) listed: bool,
+    /// Whether this directory and everything below it was read, so its totals
+    /// are exact — set once the walk is done.
+    complete: bool,
 }
 
 /// Byte order of two names — the order children and files are kept in.
@@ -164,6 +171,7 @@ impl Builder {
             });
         }
         let node = &mut self.tree.nodes[id];
+        node.listed = true;
         node.size += size;
         node.file_count += files.len() as u64;
         node.files.extend(files);
@@ -172,17 +180,28 @@ impl Builder {
     fn finish(mut self, cancelled: bool) -> ScanTree {
         let tree = &mut self.tree;
         tree.cancelled = cancelled;
+        // A cancelled walk may have stopped inside any listing: nothing in
+        // it is exact.
+        for node in &mut tree.nodes {
+            node.complete = node.listed && !cancelled;
+        }
         // Roll the totals up. A child is always created after its parent, so
         // walking the arena backwards visits every node before its parent.
         for id in (1..tree.nodes.len()).rev() {
             let node = &tree.nodes[id];
-            let (size, files, dirs, parent) =
-                (node.size, node.file_count, node.dir_count + 1, node.parent);
+            let (size, files, dirs, complete, parent) = (
+                node.size,
+                node.file_count,
+                node.dir_count + 1,
+                node.complete,
+                node.parent,
+            );
             if let Some(p) = parent {
                 let pn = &mut tree.nodes[p];
                 pn.size += size;
                 pn.file_count += files;
                 pn.dir_count += dirs;
+                pn.complete &= complete;
             }
         }
         // Sort children and files by name: lookups binary-search them, and
@@ -231,6 +250,7 @@ impl Builder {
                 continue;
             }
             let descend = opts.max_depth.map_or(true, |m| child_depth < m);
+            self.tree.nodes[id].listed = true;
             let (mut size, mut count) = (0u64, 0u64);
             for e in table.children(dir) {
                 if e.is_dir {
@@ -337,6 +357,8 @@ impl Node {
             dir_count: 0,
             children: Vec::new(),
             files: Vec::new(),
+            listed: false,
+            complete: false,
         }
     }
 }
@@ -374,10 +396,11 @@ impl ScanTree {
         tree
     }
 
-    /// A tree from snapshot entries: (key, is directory, size) in snapshot
-    /// order, where a folder comes before everything inside it. Keys are
-    /// paths relative to `root` with `/` between components.
-    pub(crate) fn from_entries(root: &Path, entries: Vec<(Vec<u8>, bool, u64)>) -> ScanTree {
+    /// A tree from snapshot entries: (key, kind, size) in snapshot order,
+    /// where a folder comes before everything inside it. Keys are paths
+    /// relative to `root` with `/` between components; kinds are the
+    /// snapshot's `ENTRY_*` values.
+    pub(crate) fn from_entries(root: &Path, entries: Vec<(Vec<u8>, u8, u64)>) -> ScanTree {
         let mut b = Builder {
             tree: ScanTree {
                 root: root.to_path_buf(),
@@ -393,9 +416,10 @@ impl ScanTree {
             pending: HashMap::new(),
             ext_ids: HashMap::new(),
         };
+        b.tree.nodes[0].listed = true;
         // Node ids of the folders on the path to the current entry.
         let mut stack: Vec<usize> = vec![0];
-        for (key, is_dir, size) in entries {
+        for (key, kind, size) in entries {
             let depth = key.iter().filter(|&&c| c == b'/').count() + 1;
             let name_bytes = key.rsplit(|&c| c == b'/').next().unwrap_or(&[]);
             let name = std::ffi::OsString::from(String::from_utf8_lossy(name_bytes).into_owned());
@@ -403,8 +427,9 @@ impl ScanTree {
             let Some(&parent) = stack.last() else {
                 continue;
             };
-            if is_dir {
+            if kind != ENTRY_FILE {
                 let id = b.push(parent, &name);
+                b.tree.nodes[id].listed = kind == ENTRY_DIR;
                 stack.push(id);
             } else {
                 let ext = b.ext_id(&name);
@@ -488,6 +513,16 @@ impl ScanTree {
     /// Flag a tree rebuilt elsewhere as the result of a cancelled walk.
     pub fn mark_cancelled(&mut self) {
         self.cancelled = true;
+        for node in &mut self.nodes {
+            node.complete = false;
+        }
+    }
+
+    /// True if every directory was read: no depth limit cut the walk short
+    /// and it was not cancelled. Only then are the totals exact — and only
+    /// then is the tree worth a snapshot to compare against.
+    pub fn complete(&self) -> bool {
+        self.nodes[0].complete
     }
 
     /// Why the MFT engine was requested but not used (e.g. no administrator
@@ -533,6 +568,7 @@ impl ScanTree {
                     path: base.join(&*n.name),
                     size: n.size,
                     file_count: n.file_count,
+                    complete: n.complete,
                 }
             })
             .collect()
@@ -642,6 +678,7 @@ impl ScanTree {
             disk_total: self.disk_total,
             disk_free: self.disk_free,
             cancelled: self.cancelled,
+            complete: node.complete,
         }
     }
 
@@ -664,6 +701,7 @@ impl ScanTree {
                 path,
                 size: n.size,
                 file_count: n.file_count,
+                complete: n.complete,
             });
         }
         out
@@ -682,6 +720,7 @@ impl ScanTree {
             let (size, files, dirs) = (n.size, n.file_count, n.dir_count + 1);
             self.nodes[parent].children.retain(|&c| c != id);
             self.subtract(parent, size, files, dirs);
+            self.recheck_complete(parent);
             // The subtree is unreachable now; give its memory back.
             let mut stack = vec![id];
             while let Some(i) = stack.pop() {
@@ -703,6 +742,21 @@ impl ScanTree {
         let file = files.remove(pos);
         self.subtract(pid, file.size, 1, 0);
         true
+    }
+
+    /// Recompute `complete` for `id` and its ancestors after a child went
+    /// away: removing the only unread folder makes the rest exact again.
+    fn recheck_complete(&mut self, mut id: usize) {
+        loop {
+            let n = &self.nodes[id];
+            let complete =
+                n.listed && !self.cancelled && n.children.iter().all(|&c| self.nodes[c].complete);
+            self.nodes[id].complete = complete;
+            match self.nodes[id].parent {
+                Some(p) => id = p,
+                None => break,
+            }
+        }
     }
 
     /// Subtract totals from `id` and every ancestor up to the root.
@@ -902,6 +956,106 @@ mod tests {
     }
 
     #[test]
+    fn depth_limit_marks_what_was_not_read() {
+        // root (depth 0) > a, b, c (1) > a/x (2) > a/x/y (3)
+        let d = tmpdir("depth");
+        write(&d.join("top.bin"), &[0u8; 100_000]);
+        write(&d.join("a/1.bin"), &[0u8; 100_000]);
+        write(&d.join("a/x/2.bin"), &[0u8; 40_000]);
+        write(&d.join("a/x/y/3.bin"), &[0u8; 20_000]);
+        write(&d.join("b/4.bin"), &[0u8; 10_000]);
+        std::fs::create_dir_all(d.join("c")).unwrap();
+        let build = |depth| {
+            let opts = Options {
+                max_depth: depth,
+                ..Default::default()
+            };
+            ScanTree::build(&d, &opts, &Progress::default())
+        };
+        let by_name = |r: &ScanReport, name: &str| {
+            r.children
+                .iter()
+                .find(|c| c.path.file_name() == Some(OsStr::new(name)))
+                .cloned()
+                .unwrap()
+        };
+
+        let full = build(None);
+        assert!(full.complete());
+        let r = full.root_report(10);
+        assert!(r.complete && r.children.iter().all(|c| c.complete));
+
+        // Depth 1: the root is listed, its folders are not.
+        let one = build(Some(1));
+        assert!(!one.complete());
+        let r = one.root_report(10);
+        assert!(!r.complete);
+        assert_eq!(r.total_files, 1);
+        assert_eq!(r.children.len(), 3);
+        for c in &r.children {
+            assert!(!c.complete, "{} was not read", c.path.display());
+            assert_eq!((c.size, c.file_count), (0, 0));
+        }
+
+        // Depth 2: a, b and c are listed; only a has a folder below.
+        let two = build(Some(2));
+        let r = two.root_report(10);
+        assert!(!r.complete);
+        let a = by_name(&r, "a");
+        assert!(!a.complete);
+        assert_eq!(a.file_count, 1, "a's own file is counted");
+        assert!(a.size > 0);
+        assert!(by_name(&r, "b").complete);
+        assert!(by_name(&r, "c").complete);
+        let x = &two.report(&d.join("a"), 10).unwrap().children[0];
+        assert!(!x.complete);
+        assert_eq!((x.size, x.file_count), (0, 0));
+        assert!(two.report(&d.join("b"), 10).unwrap().complete);
+
+        // Depth 3 still stops above y; depth 4 reads everything.
+        assert!(!build(Some(3)).complete());
+        let four = build(Some(4));
+        assert!(four.complete());
+        assert_eq!(
+            four.root_report(10).total_size,
+            full.root_report(10).total_size
+        );
+
+        // What a snapshot of a partial scan keeps, and refuses.
+        let snap = crate::Snapshot::capture(&two);
+        assert!(!snap.complete);
+        let file = d.join("partial.dgs");
+        snap.save(&file).unwrap();
+        let loaded = crate::Snapshot::load(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        assert!(!loaded.complete && loaded.has_files);
+        let back = loaded.to_tree().unwrap();
+        assert!(!back.complete());
+        assert_eq!(back.root_report(10).children, r.children);
+        let full_snap = crate::Snapshot::capture(&full);
+        assert!(full_snap.complete);
+        for (old, new) in [(&full_snap, &snap), (&snap, &full_snap)] {
+            assert!(matches!(
+                crate::diff(old, new, &d),
+                Err(crate::SnapshotError::Partial)
+            ));
+        }
+        assert!(full_snap.to_tree().unwrap().complete());
+
+        // Removing the only unread folders makes the rest exact again.
+        let mut one = one;
+        for name in ["a", "b"] {
+            assert!(one.remove(&d.join(name)));
+            assert!(!one.complete());
+        }
+        assert!(one.remove(&d.join("c")));
+        assert!(one.complete());
+        assert!(one.root_report(10).complete);
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
     fn cancelled_walk_is_flagged() {
         let d = tmpdir("cancel");
         write(&d.join("a/1.bin"), &[0u8; 10]);
@@ -911,9 +1065,11 @@ mod tests {
         assert!(tree.cancelled());
         let r = tree.root_report(10);
         assert!(r.cancelled);
+        assert!(!r.complete && !tree.complete());
         assert_eq!(r.total_files, 0);
         let ok = ScanTree::build(&d, &Options::default(), &Progress::default());
         assert!(!ok.root_report(10).cancelled);
+        assert!(ok.complete() && ok.root_report(10).complete);
         assert_eq!(ok.root_report(10).total_files, 1);
         assert_eq!(logical_total(&d), 10);
         std::fs::remove_dir_all(&d).ok();
@@ -962,6 +1118,7 @@ mod tests {
         let tree = b.finish(false);
 
         assert_eq!(tree.nodes.len(), 4, "no node created twice");
+        assert!(tree.complete(), "every folder got its batch");
         let r = tree.root_report(10);
         assert_eq!(r.total_size, 8);
         assert_eq!(r.total_files, 3);

@@ -295,7 +295,7 @@ async fn scan_dir(
         let (tree, snap) = build_tree(&app, job, &requested, &opts, &running.progress);
         drop(running);
         let view = view_of(&tree, tree.root(), top).ok_or("scan produced no tree")?;
-        let complete = !tree.cancelled();
+        let complete = tree.complete();
         let root = tree.root().to_path_buf();
         let shared: Shared = Arc::new(RwLock::new(Cached {
             tree,
@@ -305,8 +305,8 @@ async fn scan_dir(
         if let Ok(mut trees) = app.state::<AppState>().trees.lock() {
             trees.insert(job, shared.clone());
         }
-        // A cancelled walk is a partial view: browsable, but never recorded
-        // as a point in the folder's history.
+        // A cancelled or depth-limited walk is a partial view: browsable, but
+        // never recorded as a point in the folder's history.
         if complete {
             let app = app.clone();
             std::thread::spawn(move || {

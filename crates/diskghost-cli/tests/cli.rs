@@ -437,3 +437,145 @@ fn snapshot_errors_are_reported() {
 
     std::fs::remove_dir_all(&d).ok();
 }
+
+/// root/top.bin, root/a/1.bin, root/a/x/2.bin and an empty root/c.
+fn depth_fixture(label: &str) -> std::path::PathBuf {
+    let d = scratch(label);
+    std::fs::create_dir_all(d.join("a/x")).unwrap();
+    std::fs::create_dir_all(d.join("c")).unwrap();
+    std::fs::write(d.join("top.bin"), [0u8; 100]).unwrap();
+    std::fs::write(d.join("a/1.bin"), [0u8; 100]).unwrap();
+    std::fs::write(d.join("a/x/2.bin"), [0u8; 100]).unwrap();
+    d
+}
+
+#[test]
+fn max_depth_never_shows_unread_folders_as_empty() {
+    let d = depth_fixture("depth");
+    let dir = d.to_str().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(bin())
+            .args(["scan", dir])
+            .args(args)
+            .output()
+            .expect("run diskghost")
+    };
+    let child = |v: &serde_json::Value, name: &str| {
+        v["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"].as_str().unwrap().ends_with(name))
+            .cloned()
+            .unwrap()
+    };
+
+    // A full scan is complete: no flag anywhere.
+    let v = json_only(&run(&["--json"]));
+    assert!(v.get("complete").is_none(), "{v}");
+    assert!(v["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c.get("complete").is_none()));
+    assert_eq!(v["total_files"], 3);
+
+    // Depth 1: a and c were not read — not measured, never "empty".
+    let v = json_only(&run(&["--max-depth", "1", "--json"]));
+    assert_eq!(v["complete"], false);
+    assert_eq!(v["total_files"], 1);
+    for name in ["a", "c"] {
+        let c = child(&v, name);
+        assert_eq!(c["complete"], false, "{c}");
+        assert_eq!(c["size"], 0);
+    }
+    let out = run(&["--max-depth", "1"]);
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("total: ≥ "), "{s}");
+    assert!(s.contains("DEPTH LIMIT (--max-depth 1)"), "{s}");
+    for name in ["a", "c"] {
+        let line = s
+            .lines()
+            .find(|l| l.trim_end().ends_with(&format!("{name}  (not measured)")))
+            .unwrap_or_else(|| panic!("no unmeasured line for {name}:\n{s}"));
+        assert!(line.trim_start().starts_with("? "), "{line}");
+        assert!(!line.contains(" B "), "{line}");
+    }
+
+    // Depth 2: a's own file is counted, a/x is not — a is a lower bound;
+    // c was read and really is empty.
+    let v = json_only(&run(&["--max-depth", "2", "--json"]));
+    let a = child(&v, "a");
+    assert_eq!(a["complete"], false);
+    assert_eq!(a["file_count"], 1);
+    assert!(a["size"].as_u64().unwrap() > 0);
+    assert!(child(&v, "c").get("complete").is_none());
+    let s = String::from_utf8_lossy(&run(&["--max-depth", "2"]).stdout).into_owned();
+    let line = s
+        .lines()
+        .find(|l| {
+            l.trim_end()
+                .ends_with(&format!("{}a", std::path::MAIN_SEPARATOR))
+        })
+        .unwrap_or_else(|| panic!("no line for a:\n{s}"));
+    assert!(line.trim_start().starts_with("≥ "), "{line}");
+
+    // A limit deeper than the tree reads everything.
+    let v = json_only(&run(&["--max-depth", "3", "--json"]));
+    assert!(v.get("complete").is_none(), "{v}");
+    assert_eq!(v["total_files"], 3);
+
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn max_depth_is_refused_where_it_would_mislead() {
+    let d = depth_fixture("depthbad");
+    let dir = d.to_str().unwrap();
+    // A valid snapshot to compare against, from a full scan.
+    let full = d.join("full.dgs");
+    let out = Command::new(bin())
+        .args(["scan", dir, "--save", full.to_str().unwrap()])
+        .output()
+        .expect("run diskghost");
+    assert!(out.status.success(), "{out:?}");
+    let snap = d.join("s.dgs");
+    for (args, why) in [
+        (
+            vec![
+                "scan",
+                dir,
+                "--max-depth",
+                "1",
+                "--save",
+                snap.to_str().unwrap(),
+            ],
+            "cannot be used with",
+        ),
+        (
+            vec![
+                "scan",
+                dir,
+                "--max-depth",
+                "1",
+                "--since",
+                full.to_str().unwrap(),
+            ],
+            "cannot be used with",
+        ),
+        (vec!["scan", dir, "--max-depth", "0"], "invalid value '0'"),
+        (vec!["dupes", dir, "--max-depth", "0"], "invalid value '0'"),
+    ] {
+        let out = Command::new(bin())
+            .args(&args)
+            .output()
+            .expect("run diskghost");
+        assert!(!out.status.success(), "{args:?} should fail");
+        assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(why), "{args:?}: {err}");
+    }
+    assert!(!snap.exists(), "no snapshot of a partial scan");
+    std::fs::remove_dir_all(&d).ok();
+}

@@ -33,6 +33,18 @@ pub const DIFF_FILE_LIMIT: usize = 1000;
 
 const MAGIC: &[u8; 8] = b"DGSNAP02";
 
+/// What an entry of the stream is (its first byte).
+pub(crate) const ENTRY_FILE: u8 = 0;
+pub(crate) const ENTRY_DIR: u8 = 1;
+/// A directory whose contents were never read (the depth limit, or a
+/// cancelled walk). Readers before 0.12 take it for an ordinary directory.
+pub(crate) const ENTRY_UNREAD_DIR: u8 = 2;
+
+/// Header flags.
+const FLAG_HAS_FILES: u64 = 1;
+/// Some directory was not read, or the walk was cancelled.
+const FLAG_PARTIAL: u64 = 2;
+
 /// Why a snapshot could not be read, written or compared.
 #[derive(Debug)]
 pub enum SnapshotError {
@@ -49,6 +61,9 @@ pub enum SnapshotError {
     },
     /// The directory to compare at is not part of the newer snapshot.
     NotInSnapshot(PathBuf),
+    /// A snapshot of a scan that did not read every folder: compared, the
+    /// folders it skipped would look emptied.
+    Partial,
 }
 
 impl fmt::Display for SnapshotError {
@@ -70,6 +85,10 @@ impl fmt::Display for SnapshotError {
             SnapshotError::NotInSnapshot(p) => {
                 write!(f, "not a directory in the snapshot: {}", p.display())
             }
+            SnapshotError::Partial => write!(
+                f,
+                "a scan that did not read every folder (depth limit, or cancelled) cannot be compared"
+            ),
         }
     }
 }
@@ -101,6 +120,9 @@ pub struct Snapshot {
     pub total_dirs: u64,
     /// Whether every file is recorded. Format 1 snapshots only know folders.
     pub has_files: bool,
+    /// Whether the scan read every folder (see [`ScanTree::complete`]). Only
+    /// complete snapshots can be compared.
+    pub complete: bool,
     /// Number of recorded entries (directories plus files).
     pub entries: u64,
     /// The zstd-compressed entry stream.
@@ -220,19 +242,19 @@ impl Encoder {
         }
     }
 
-    fn entry(&mut self, key: &[u8], dir: bool, size: u64, files: u64) {
+    fn entry(&mut self, key: &[u8], kind: u8, size: u64, files: u64) {
         let shared = self
             .prev
             .iter()
             .zip(key)
             .take_while(|(a, b)| a == b)
             .count();
-        self.buf.push(u8::from(dir));
+        self.buf.push(kind);
         put_varint(&mut self.buf, shared as u64);
         put_varint(&mut self.buf, (key.len() - shared) as u64);
         self.buf.extend_from_slice(&key[shared..]);
         put_varint(&mut self.buf, size);
-        if dir {
+        if kind != ENTRY_FILE {
             put_varint(&mut self.buf, files);
         }
         self.prev.truncate(shared);
@@ -261,6 +283,7 @@ struct Cursor<'a> {
     r: BufReader<zstd::stream::read::Decoder<'a, &'a [u8]>>,
     left: u64,
     key: Vec<u8>,
+    kind: u8,
     dir: bool,
     size: u64,
     files: u64,
@@ -276,6 +299,7 @@ impl<'a> Cursor<'a> {
             ),
             left: s.entries,
             key: Vec::new(),
+            kind: ENTRY_FILE,
             dir: false,
             size: 0,
             files: 0,
@@ -290,7 +314,8 @@ impl<'a> Cursor<'a> {
             return Ok(());
         }
         self.left -= 1;
-        self.dir = get_u8(&mut self.r)? != 0;
+        self.kind = get_u8(&mut self.r)?;
+        self.dir = self.kind != ENTRY_FILE;
         let shared = get_varint(&mut self.r)? as usize;
         let len = get_varint(&mut self.r)? as usize;
         if shared > self.key.len() || len > 1 << 20 {
@@ -328,6 +353,7 @@ impl Snapshot {
             total_files: root.file_count,
             total_dirs: r.total_dirs,
             has_files: true,
+            complete: tree.complete(),
             entries,
             data,
         }
@@ -389,7 +415,8 @@ impl Snapshot {
             total_size,
             total_files,
             total_dirs,
-            has_files: flags & 1 == 1,
+            has_files: flags & FLAG_HAS_FILES != 0,
+            complete: flags & FLAG_PARTIAL == 0,
             entries,
             data: b[root_len..].to_vec(),
         })
@@ -408,7 +435,7 @@ impl Snapshot {
         dirs.sort_by(|a, b| cmp_key(&a.0, &b.0));
         let mut enc = Encoder::new();
         for (k, d) in &dirs {
-            enc.entry(k, true, d.size, d.file_count);
+            enc.entry(k, ENTRY_DIR, d.size, d.file_count);
         }
         let (data, entries) = enc.finish();
         Ok(Snapshot {
@@ -419,6 +446,7 @@ impl Snapshot {
             total_files: old.total_files,
             total_dirs: old.total_dirs,
             has_files: false,
+            complete: true,
             entries,
             data,
         })
@@ -432,6 +460,13 @@ impl Snapshot {
             std::fs::create_dir_all(parent)?;
         }
         let root = self.root.to_string_lossy();
+        let mut flags = 0;
+        if self.has_files {
+            flags |= FLAG_HAS_FILES;
+        }
+        if !self.complete {
+            flags |= FLAG_PARTIAL;
+        }
         let mut out = Vec::with_capacity(self.data.len() + 80 + root.len());
         out.extend_from_slice(MAGIC);
         for v in [
@@ -440,7 +475,7 @@ impl Snapshot {
             self.total_files,
             self.total_dirs,
             self.entries,
-            u64::from(self.has_files),
+            flags,
             root.len() as u64,
             self.data.len() as u64,
         ] {
@@ -472,7 +507,7 @@ impl Snapshot {
         let mut c = Cursor::new(self)?;
         c.advance()?;
         while !c.done {
-            entries.push((c.key.clone(), c.dir, c.size));
+            entries.push((c.key.clone(), c.kind, c.size));
             c.advance()?;
         }
         Ok(ScanTree::from_entries(&self.root, entries))
@@ -489,6 +524,9 @@ impl Snapshot {
                     path: path_of_key(&self.root, &c.key),
                     size: c.size,
                     file_count: c.files,
+                    // Which folders a partial scan read fully is not
+                    // recorded: all of them are lower bounds.
+                    complete: self.complete,
                 });
             }
             c.advance()?;
@@ -516,13 +554,18 @@ fn capture_node(tree: &ScanTree, id: usize, key: &mut Vec<u8>, enc: &mut Encoder
             let c = node.children[d];
             let child = &tree.nodes[c];
             key.extend_from_slice(child.name.as_encoded_bytes());
-            enc.entry(key, true, child.size, child.file_count);
+            let kind = if child.listed {
+                ENTRY_DIR
+            } else {
+                ENTRY_UNREAD_DIR
+            };
+            enc.entry(key, kind, child.size, child.file_count);
             capture_node(tree, c, key, enc);
             d += 1;
         } else {
             let file = &node.files[f];
             key.extend_from_slice(file.name.as_encoded_bytes());
-            enc.entry(key, false, file.size, 0);
+            enc.entry(key, ENTRY_FILE, file.size, 0);
             f += 1;
         }
         key.truncate(len);
@@ -673,6 +716,9 @@ impl TopFiles {
 /// — every file below `at` that is new, gone or changed in size. A folder
 /// missing from the older snapshot counts as having been empty.
 pub fn diff(old: &Snapshot, new: &Snapshot, at: &Path) -> Result<DiffReport, SnapshotError> {
+    if !old.complete || !new.complete {
+        return Err(SnapshotError::Partial);
+    }
     if old.root != new.root {
         return Err(SnapshotError::RootMismatch {
             old: old.root.clone(),
@@ -801,6 +847,7 @@ impl Acc<'_> {
                     path: path_of_key(self.root, &c.key),
                     size: c.size,
                     file_count: c.files,
+                    complete: true,
                 };
                 if is_new {
                     self.added.push(d);
