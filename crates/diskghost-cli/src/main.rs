@@ -96,12 +96,12 @@ enum Command {
         #[command(flatten)]
         walk: WalkArgs,
         /// Save the scan as a snapshot (every folder and file, compressed) for a
-        /// later `--since` or `diff`.
-        #[arg(long, value_name = "FILE")]
+        /// later `--since` or `diff`. Needs the whole tree: not with --max-depth.
+        #[arg(long, value_name = "FILE", conflicts_with = "max_depth")]
         save: Option<PathBuf>,
         /// Compare against a snapshot saved earlier: what grew, shrank,
-        /// appeared or vanished since then.
-        #[arg(long, value_name = "FILE")]
+        /// appeared or vanished since then. Not with --max-depth.
+        #[arg(long, value_name = "FILE", conflicts_with = "max_depth")]
         since: Option<PathBuf>,
     },
     /// Compare two snapshots saved with `scan --save`.
@@ -158,8 +158,10 @@ struct WalkArgs {
     /// e.g. --exclude "*.tmp" --exclude node_modules
     #[arg(long)]
     exclude: Vec<String>,
-    /// Limit recursion depth below the root (1 = the root's direct children).
-    #[arg(long)]
+    /// Read only this many levels below the root (1 = the root's own entries).
+    /// Folders the limit cuts off are not measured: their sizes are reported
+    /// as lower bounds, or as not measured at all.
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     max_depth: Option<usize>,
     /// Follow symbolic links / junctions.
     #[arg(long)]
@@ -274,7 +276,7 @@ fn main() -> ExitCode {
                 };
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {
-                print_scan(&report);
+                print_scan(&report, walk.max_depth);
                 if let Some(d) = &changes {
                     println!();
                     print_diff(d);
@@ -527,10 +529,21 @@ fn fmt_duration(d: std::time::Duration) -> String {
     }
 }
 
-fn print_scan(r: &ScanReport) {
+/// A folder's size as far as it is known: `≥` when part of it was not read,
+/// `?` when none of it was.
+fn dir_size_text(size: u64, complete: bool) -> String {
+    match (complete, size) {
+        (true, _) => human_size(size),
+        (false, 0) => "?".to_string(),
+        (false, _) => format!("≥ {}", human_size(size)),
+    }
+}
+
+fn print_scan(r: &ScanReport, max_depth: Option<usize>) {
     println!("Scan of {}", r.root.display());
+    let at_least = if r.complete { "" } else { "≥ " };
     println!(
-        "  total: {} across {} files in {} dirs",
+        "  total: {at_least}{} across {at_least}{} files in {at_least}{} dirs",
         human_size(r.total_size),
         r.total_files,
         r.total_dirs
@@ -550,12 +563,26 @@ fn print_scan(r: &ScanReport) {
     }
     if r.cancelled {
         println!("  CANCELLED: partial result, the numbers cover only what was scanned");
+    } else if !r.complete {
+        let limit = max_depth.map_or(String::new(), |m| format!(" (--max-depth {m})"));
+        println!(
+            "  DEPTH LIMIT{limit}: deeper folders were not read; ≥ marks a lower bound, ? a folder not measured"
+        );
     }
     println!();
 
     println!("Biggest sub-folders:");
     for d in &r.children {
-        println!("  {:>10}  {}", human_size(d.size), d.path.display());
+        let note = if !d.complete && d.size == 0 {
+            "  (not measured)"
+        } else {
+            ""
+        };
+        println!(
+            "  {:>10}  {}{note}",
+            dir_size_text(d.size, d.complete),
+            d.path.display()
+        );
     }
     if r.root_files_count > 0 {
         println!(

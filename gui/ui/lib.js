@@ -15,6 +15,27 @@
     return i === 0 ? `${bytes} B` : `${s.toFixed(1)} ${u[i]}`;
   }
 
+  // Whether a folder entry was not read at all (beyond the depth limit). An
+  // entry without `complete` was read in full.
+  function unmeasured(item) {
+    return item.complete === false && !item.size;
+  }
+
+  // A folder's size as far as it is known: "≥ 1.5 KB" when part of it was not
+  // read, `notMeasured` when none of it was.
+  function sizeText(item, notMeasured) {
+    if (item.complete !== false) return human(item.size);
+    return unmeasured(item) ? notMeasured : `≥ ${human(item.size)}`;
+  }
+
+  // A folder's file count, formatted by `fmt`, the same way ("—" when not
+  // read at all).
+  function countText(item, fmt) {
+    const n = fmt(item.file_count);
+    if (item.complete !== false) return n;
+    return unmeasured(item) ? "—" : `≥ ${n}`;
+  }
+
   // A signed byte difference: +1.5 KB / -1.5 KB / 0 B.
   function humanDelta(delta) {
     if (!delta) return "0 B";
@@ -396,7 +417,7 @@
   }
 
   return {
-    human, humanDelta, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
+    human, humanDelta, unmeasured, sizeText, countText, fmtMs, baseName, fmtDate, crumbs, squarify, deltaTint, changesByPath,
     pct, EXCLUDE_PRESETS, DEFAULT_SETTINGS, mergeSettings, activeExcludes, categoryOf,
     categorize, bucketLabel, jobsToStart, driveKey, mapItems, parentPath, isUnder, SETTINGS_VERSION,
     isProtectedPath, folderSets, protectedExcludes, dropReclaimed,

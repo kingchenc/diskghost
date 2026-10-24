@@ -86,7 +86,10 @@ cargo install --path crates/diskghost-cli
 diskghost scan "C:\Users\me\Desktop" --top 20
 
 # Scan options (an invalid exclude glob is an error, never silently skipped)
-diskghost scan . --exclude node_modules --exclude "*.tmp" --max-depth 3 --follow-symlinks
+diskghost scan . --exclude node_modules --exclude "*.tmp" --follow-symlinks
+
+# Read only 2 levels deep: faster, but folders below are not measured
+diskghost scan . --max-depth 2
 
 # Duplicates (ignore anything under 5 MB)
 diskghost dupes "D:\Media" --min-mb 5
@@ -109,6 +112,13 @@ diskghost scan "C:\Users\me" --since before.dgs --save after.dgs
 diskghost diff before.dgs after.dgs                      # compare two saved snapshots
 diskghost diff before.dgs after.dgs --at "C:\Users\me\Downloads"   # ...at a sub-folder
 ```
+
+`--max-depth N` stops the walk N levels below the root (1 = only the
+root's own entries). Folders it cuts off are never shown as empty: one that
+was not read at all reads `?  … (not measured)`, one read only partly
+`≥ 1.2 GB` (a lower bound), and the totals carry `≥` too. Such a scan cannot
+be saved or compared (`--save` / `--since`), since every folder it skipped
+would look emptied. For exact numbers, scan without it.
 
 A scheduled task (cron, Task Scheduler) that runs
 `diskghost scan <dir> --since last.dgs --save last.dgs --json` gives you a
@@ -137,6 +147,11 @@ even when stdout and stderr end up in the same file (`2>&1`). Errors go to
 stderr with a non-zero exit code and leave stdout empty; only `rm` and
 `dupes --reclaim` still print their report when some files could not be
 removed, with the failures in its `errors`.
+
+A scan cut short by `--max-depth` (or cancelled) has `"complete": false` at
+the top and on every folder in `children` that was not fully read; its
+`size` and `file_count` are then lower bounds, 0 for a folder that was not
+read at all. Complete entries carry no `complete` field.
 
 Perfect for wiring into an automation/agent that decides what to clean.
 
@@ -174,7 +189,9 @@ A modern Tauri UI lives in `gui/`:
   list length, max depth, symlinks, parallel scans, snapshots kept per folder,
   duplicate minimum size, Recycle Bin vs. permanent delete, window size at start
   (1440p if it fits the screen, otherwise maximized; or 1080p / 4K / maximized),
-  language. The version is shown next to the name.
+  language. The version is shown next to the name. With a max depth set,
+  folders below it show "not measured" (or `≥` when partly read) instead of a
+  size, and such a scan is neither kept as a snapshot nor compared.
 - **Find duplicates** — every group is byte-identical content (BLAKE3 over the
   whole file), whatever the names. Copies inside installed programs and games
   (Steam, Epic, Battle.net, Program Files, …; DLLs, game archives) are there on

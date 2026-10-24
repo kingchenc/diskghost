@@ -148,6 +148,20 @@ pub struct DirSize {
     pub path: PathBuf,
     pub size: u64,
     pub file_count: u64,
+    /// False if part of the folder was never read (it lies at or below the
+    /// depth limit, or the walk was cancelled): `size` and `file_count` are
+    /// then lower bounds, and 0 when the folder itself was not read. Written
+    /// only when false.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub complete: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// Bytes and file count of one file extension.
@@ -212,6 +226,11 @@ pub struct ScanReport {
     /// above then covers only the part of the tree seen before the stop.
     #[serde(default)]
     pub cancelled: bool,
+    /// False if some folder below was never read (depth limit, or a
+    /// cancelled walk): every number above is then a lower bound. Written
+    /// only when false.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub complete: bool,
 }
 
 /// A group of byte-identical files (hard links to the same physical file are

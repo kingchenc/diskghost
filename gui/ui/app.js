@@ -1,6 +1,7 @@
 "use strict";
 
-// Pure helpers (human, humanDelta, fmtMs, baseName, fmtDate, crumbs, squarify,
+// Pure helpers (human, humanDelta, unmeasured, sizeText, countText, fmtMs,
+// baseName, fmtDate, crumbs, squarify,
 // deltaTint, changesByPath, pct, EXCLUDE_PRESETS, mergeSettings,
 // activeExcludes, categorize, bucketLabel, jobsToStart, mapItems, parentPath,
 // isUnder) come from lib.js as globals.
@@ -44,6 +45,8 @@ const I18N = {
     backHint: "Previous folder (mouse back button, Alt+←)", upHint: "Parent folder (right-click the map, Backspace, Alt+↑)",
     cancelling: "Cancelling…",
     cancelledNotice: "This scan was cancelled — every number covers only the part that was walked.",
+    depthNotice: "Max depth: deeper folders were not read. ≥ marks a lower bound, “not measured” a folder that was not read at all — and only a complete scan can be compared.",
+    notMeasured: "not measured",
     kSize: "Size", kSizeOfUsed: "of the used space on", kSizeOfDisk: "of the disk",
     kFiles: "Files", kAvg: "avg", kPerFile: "per file",
     kFolders: "Folders", kDirect: "files directly in this folder",
@@ -153,6 +156,8 @@ const I18N = {
     backHint: "Vorheriger Ordner (Maus-Zurück-Taste, Alt+←)", upHint: "Übergeordneter Ordner (Rechtsklick auf die Karte, Rücktaste, Alt+↑)",
     cancelling: "Breche ab…",
     cancelledNotice: "Dieser Scan wurde abgebrochen — alle Zahlen decken nur den gescannten Teil ab.",
+    depthNotice: "Max. Tiefe: Tiefere Ordner wurden nicht gelesen. ≥ markiert eine Untergrenze, „nicht gemessen“ einen Ordner, der gar nicht gelesen wurde — und vergleichen lässt sich nur ein vollständiger Scan.",
+    notMeasured: "nicht gemessen",
     kSize: "Größe", kSizeOfUsed: "des belegten Platzes auf", kSizeOfDisk: "der Platte",
     kFiles: "Dateien", kAvg: "Ø", kPerFile: "pro Datei",
     kFolders: "Ordner", kDirect: "Dateien direkt in diesem Ordner",
@@ -601,10 +606,12 @@ async function runJob(j) {
       j.diff = null;
       j.history = null;
       j.state = view.cancelled ? "cancelled" : "done";
+      // Cancelled or cut off by the depth limit: browsable, not comparable.
+      j.partial = view.complete === false;
       const back = j.returnTo;
       j.returnTo = null;
       if (back && back !== j.root) navigate(j, back, { keepTab: true, record: false });
-      if (!view.cancelled) autoCompare(j);
+      if (!j.partial) autoCompare(j);
       if (view.mft_fallback) status(`${t("mftFallback")}: ${view.mft_fallback}`, true);
     } else {
       j.groups = await invoke("find_dupes", { job: j.id, path: j.root, mb: j.mb, opts: j.opts });
@@ -968,7 +975,8 @@ function scanView(j) {
     el("button", { type: "button", class: "small", onclick: () => enqueue("dupes", j.path) }, `👯 ${t("dupesHere")}`),
     el("button", { type: "button", class: "small", onclick: () => rescan(j) }, `↻ ${t("rescan")}`));
   view.append(el("div", { class: "full", style: { display: "flex", flexDirection: "column", gap: "12px" } },
-    head, v.cancelled ? el("div", { class: "notice", text: `⚠ ${t("cancelledNotice")}` }) : null));
+    head, v.cancelled ? el("div", { class: "notice", text: `⚠ ${t("cancelledNotice")}` })
+      : v.complete === false ? el("div", { class: "notice", text: `⚠ ${t("depthNotice")}` }) : null));
 
   view.append(kpiRow(j, v));
 
@@ -1002,14 +1010,15 @@ function kpiRow(j, v) {
   const row = el("div", { class: "kpis full" });
   const d = driveOf(v.root);
   const used = v.disk_total - v.disk_free;
-  row.append(kpi(t("kSize"), human(v.total_size),
+  const atLeast = v.complete === false ? "≥ " : "";
+  row.append(kpi(t("kSize"), atLeast + human(v.total_size),
     used > 0 ? `${pct(v.total_size, used)} ${t("kSizeOfUsed")} ${d ? d.path : t("kSizeOfDisk")}` : null));
-  row.append(kpi(t("kFiles"), num(v.total_files),
+  row.append(kpi(t("kFiles"), atLeast + num(v.total_files),
     v.total_files ? `${t("kAvg")} ${human(Math.round(v.total_size / v.total_files))} ${t("kPerFile")}` : null));
-  row.append(kpi(t("kFolders"), num(v.total_dirs), `${num(v.root_files_count)} ${t("kDirect")}`));
+  row.append(kpi(t("kFolders"), atLeast + num(v.total_dirs), `${num(v.root_files_count)} ${t("kDirect")}`));
   const bigDir = v.children[0];
   if (bigDir) {
-    row.append(kpi(t("kBiggestFolder"), baseName(bigDir.path), `${human(bigDir.size)} · ${pct(bigDir.size, v.total_size)} · ${num(bigDir.file_count)} ${t("files")}`,
+    row.append(kpi(t("kBiggestFolder"), baseName(bigDir.path), `${sizeText(bigDir, t("notMeasured"))} · ${pct(bigDir.size, v.total_size)} · ${countText(bigDir, num)} ${t("files")}`,
       { role: "button", tabindex: "0", style: { cursor: "pointer" }, onclick: () => navigate(j, bigDir.path) }, "name"));
   }
   const bigFile = v.top_files[0];
@@ -1071,6 +1080,7 @@ async function autoCompare(j) {
 // folder on screen against the newest earlier snapshot.
 async function openCompare(j) {
   j.tab = "changes";
+  if (j.partial) return renderMain();
   if (j.path === j.root && j.auto?.state === "done") {
     j.diff = j.auto.diff;
     j.sinceAt = j.diff.old_taken_at;
@@ -1155,10 +1165,10 @@ function drawTreemap(container, j) {
     node.style.height = `${Math.max(0, h)}px`;
     container.append(node);
   };
-  const label = (name, size, share, w, h, stacked) => {
+  const label = (name, item, share, w, h, stacked) => {
     if (w < 46 || h < 18) return [];
     const out = [el("span", { class: "tn", text: name })];
-    if (stacked ? h > 34 : w > 150) out.push(el("span", { class: "ts", text: `${human(size)}${share ? ` · ${share}` : ""}` }));
+    if (stacked ? h > 34 : w > 150) out.push(el("span", { class: "ts", text: `${sizeText(item, t("notMeasured"))}${share ? ` · ${share}` : ""}` }));
     return out;
   };
   const decorate = (node, path) => {
@@ -1170,10 +1180,10 @@ function drawTreemap(container, j) {
   };
   const folderTip = (item, parentSize) => () => {
     const out = [el("b", { text: item.path ? baseName(item.path) : item.label }), item.path ? el("div", { class: "tp", text: item.path }) : null,
-      tipRow(t("colSize"), human(item.size)),
+      tipRow(t("colSize"), sizeText(item, t("notMeasured"))),
       tipRow(`${t("colPct")} ${t("shareOfView")}`, pct(item.size, v.total_size))];
     if (item.path && parentSize && parentSize !== v.total_size) out.push(tipRow(`${t("colPct")} ${baseName(parentPath(item.path) || "")}`, pct(item.size, parentSize)));
-    if (item.file_count != null) out.push(tipRow(t("colFiles"), num(item.file_count)));
+    if (item.file_count != null) out.push(tipRow(t("colFiles"), countText(item, num)));
     const c = diffMap?.map.get(String(item.path));
     if (c) out.push(tipRow(t("colDelta"), c.added ? t("newBadge") : humanDelta(c.delta)));
     return out;
@@ -1185,7 +1195,7 @@ function drawTreemap(container, j) {
     if (!it.path) {
       it.label = it.rest === "files" ? `${num(v.root_files_count)} ${t("filesHere")}` : t("otherFolders");
       const node = el("div", { class: "tile l1 leaf rest" });
-      node.append(el("div", { class: "thead" }, label(it.label, it.size, pct(it.size, v.total_size), w, h, true)));
+      node.append(el("div", { class: "thead" }, label(it.label, it, pct(it.size, v.total_size), w, h, true)));
       tip(node, folderTip(it));
       place(node, x, y, w, h);
       continue;
@@ -1193,7 +1203,7 @@ function drawTreemap(container, j) {
     const framed = w > 150 && h > 90 && it.nested.length > 0;
     const node = el("button", { type: "button", class: `tile l1${framed ? "" : " leaf"}`, onclick: () => navigate(j, it.path) });
     node.style.setProperty("--s", String(Math.sqrt(it.size / maxL1)));
-    node.append(el("div", { class: "thead" }, label(baseName(it.path), it.size, pct(it.size, v.total_size), w, h, !framed)));
+    node.append(el("div", { class: "thead" }, label(baseName(it.path), it, pct(it.size, v.total_size), w, h, !framed)));
     decorate(node, it.path);
     tip(node, folderTip(it));
     place(node, x, y, w, h);
@@ -1206,13 +1216,13 @@ function drawTreemap(container, j) {
       const x2 = r2.x + 1, y2 = r2.y + 1, w2 = r2.w - 2, h2 = r2.h - 2;
       if (!n2.path) {
         n2.label = t("filesSmaller");
-        const rest = el("div", { class: "tile l2 rest" }, label(n2.label, n2.size, null, w2, h2, true));
+        const rest = el("div", { class: "tile l2 rest" }, label(n2.label, n2, null, w2, h2, true));
         tip(rest, folderTip(n2, it.size));
         place(rest, x2, y2, w2, h2);
         continue;
       }
       const t2 = el("button", { type: "button", class: "tile l2", onclick: (e) => { e.stopPropagation(); navigate(j, n2.path); } },
-        label(baseName(n2.path), n2.size, null, w2, h2, true));
+        label(baseName(n2.path), n2, null, w2, h2, true));
       t2.style.setProperty("--s", String(Math.sqrt(n2.size / maxL2)));
       tip(t2, folderTip(n2, it.size));
       place(t2, x2, y2, w2, h2);
@@ -1267,9 +1277,9 @@ function foldersTab(j, v, body, diffMap) {
     tb.append(el("tr", { class: cls, onclick: () => navigate(j, d.path) },
       el("td", { class: "namecell" }, el("div", { class: "nm", text: `📁 ${baseName(d.path)}` }), el("div", { class: "pth", text: d.path })),
       el("td", { class: "barcell" }, shareBar(d.size, v.total_size)),
-      el("td", { class: "num", text: human(d.size) }),
-      el("td", { class: "num", text: pct(d.size, v.total_size) }),
-      el("td", { class: "num", text: num(d.file_count) }),
+      el("td", { class: "num", text: sizeText(d, t("notMeasured")) }),
+      el("td", { class: "num", text: unmeasured(d) ? "—" : pct(d.size, v.total_size) }),
+      el("td", { class: "num", text: countText(d, num) }),
       diffMap ? el("td", { class: "num" }, el("span", { class: "delta", text: delta })) : null,
       el("td", { class: "acts" }, delButton(d.path))));
   }
@@ -1397,7 +1407,7 @@ function sizesTab(v, body) {
 // Every complete scan is stored as a snapshot of its root (every folder and
 // file, compressed). Compare the folder on screen against an earlier one.
 async function changesTab(j, v, body, tools) {
-  if (v.cancelled) return body.append(el("div", { class: "muted", text: t("cancelledNotice") }));
+  if (j.partial) return body.append(el("div", { class: "muted", text: t(v.cancelled ? "cancelledNotice" : "depthNotice") }));
   if (!j.history) {
     try {
       j.history = (await invoke("list_snapshots", { job: j.id })).snapshots || [];

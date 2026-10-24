@@ -15,6 +15,25 @@ test("human formats bytes like the Rust side", () => {
   assert.equal(lib.human(1024 ** 6), "1024.0 PB"); // capped at PB
 });
 
+test("sizes of folders the depth limit cut off are never shown as empty", () => {
+  const fmt = (n) => String(n);
+  const full = { size: 1536, file_count: 3 };
+  assert.equal(lib.sizeText(full, "n/m"), "1.5 KB");
+  assert.equal(lib.countText(full, fmt), "3");
+  assert.equal(lib.unmeasured(full), false);
+  const empty = { size: 0, file_count: 0, complete: true };
+  assert.equal(lib.sizeText(empty, "n/m"), "0 B");
+  assert.equal(lib.countText(empty, fmt), "0");
+  const partly = { size: 1536, file_count: 3, complete: false };
+  assert.equal(lib.sizeText(partly, "n/m"), "≥ 1.5 KB");
+  assert.equal(lib.countText(partly, fmt), "≥ 3");
+  assert.equal(lib.unmeasured(partly), false);
+  const unread = { size: 0, file_count: 0, complete: false };
+  assert.equal(lib.sizeText(unread, "n/m"), "n/m");
+  assert.equal(lib.countText(unread, fmt), "—");
+  assert.equal(lib.unmeasured(unread), true);
+});
+
 test("humanDelta carries the sign", () => {
   assert.equal(lib.humanDelta(0), "0 B");
   assert.equal(lib.humanDelta(1536), "+1.5 KB");
