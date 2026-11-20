@@ -48,6 +48,9 @@ struct Ctx<'a> {
     /// Canonical directories already entered — only kept when following
     /// links, where a link back up the tree would otherwise loop forever.
     seen: Option<Mutex<HashSet<PathBuf>>>,
+    /// Inodes already counted — hard links and followed symlinks reach the
+    /// same file through several names; it is charged only once.
+    files_seen: Mutex<HashSet<(u64, u64)>>,
 }
 
 impl Ctx<'_> {
@@ -105,6 +108,7 @@ pub(crate) fn walk_dyn(
         progress,
         tx,
         seen: opts.follow_symlinks.then(|| Mutex::new(HashSet::new())),
+        files_seen: Mutex::new(HashSet::new()),
     };
     if ctx.follow {
         ctx.first_visit(root);
@@ -216,6 +220,16 @@ fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth
                     continue;
                 }
             };
+            if let Some(id) = file_key(&meta) {
+                let first = ctx
+                    .files_seen
+                    .lock()
+                    .map(|mut s| s.insert(id))
+                    .unwrap_or(true);
+                if !first {
+                    continue;
+                }
+            }
             let size = on_disk_size(&meta, &path);
             bytes += size;
             b.modified.push(modified_ns(&meta));
@@ -235,10 +249,143 @@ fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth
     let _ = ctx.tx.send(b);
 }
 
+/// Device+inode identity of a counted file, so the same file reached through
+/// a second name (hard link) or a second path (followed symlink) is not
+/// charged twice. `None` where the platform supplies no identity.
+#[cfg(unix)]
+fn file_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// `file_key` on Windows: volume serial + file index.
+#[cfg(windows)]
+fn file_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    let index = meta.file_index();
+    (index != 0).then(|| (meta.volume_serial_number(), index))
+}
+
+/// `file_key` fallback: no identity available — no dedup.
+#[cfg(not(any(unix, windows)))]
+fn file_key(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
 /// Modification time in nanoseconds since the Unix epoch (0 if unknown).
 pub(crate) fn modified_ns(meta: &std::fs::Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{scan_with_progress, Options, Progress};
+    use std::io::Write;
+
+    fn tmpdir(label: &str) -> PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!("diskghost-walk-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write(path: &Path, content: &[u8]) {
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(content).unwrap();
+    }
+
+    fn allocated(path: &Path) -> u64 {
+        let m = std::fs::metadata(path).unwrap();
+        on_disk_size(&m, path)
+    }
+
+    /// Two names for one inode must add their bytes once, not twice — a
+    /// backup tree made of `cp -al` / `--link-dest` hard links otherwise
+    /// reports a multiple of the space it actually occupies.
+    #[test]
+    fn hardlinked_entries_share_one_charge() {
+        let d = tmpdir("hardlink");
+        let a = d.join("a.bin");
+        write(&a, &[7u8; 100_000]);
+        std::fs::hard_link(&a, d.join("b.bin")).unwrap();
+        write(&d.join("c.bin"), &[3u8; 10_000]);
+
+        let r = scan_with_progress(&d, 10, &Options::default(), &Progress::default());
+        assert_eq!(r.total_files, 2, "a hard link is not a second file");
+        assert_eq!(r.total_size, allocated(&a) + allocated(&d.join("c.bin")));
+    }
+
+    /// With links followed, a symlink to a file inside the scan reaches the
+    /// same inode as the real path — it must not be charged again.
+    #[cfg(unix)]
+    #[test]
+    fn followed_symlink_to_file_is_charged_once() {
+        let d = tmpdir("symlink-file");
+        let a = d.join("sub").join("a.bin");
+        write(&a, &[9u8; 100_000]);
+        std::os::unix::fs::symlink(&a, d.join("link")).unwrap();
+
+        let opts = Options {
+            follow_symlinks: true,
+            ..Options::default()
+        };
+        let r = scan_with_progress(&d, 10, &opts, &Progress::default());
+        assert_eq!(r.total_files, 1, "link and target are one file");
+        assert_eq!(r.total_size, allocated(&a));
+    }
+
+    /// A symlink to an already-walked directory is not descended into twice
+    /// (guards the existing `seen` set — regression coverage).
+    #[cfg(unix)]
+    #[test]
+    fn followed_symlink_to_dir_is_not_rewalked() {
+        let d = tmpdir("symlink-dir");
+        write(&d.join("real").join("x.bin"), &[5u8; 100_000]);
+        std::os::unix::fs::symlink(d.join("real"), d.join("alias")).unwrap();
+
+        let opts = Options {
+            follow_symlinks: true,
+            ..Options::default()
+        };
+        let r = scan_with_progress(&d, 10, &opts, &Progress::default());
+        assert_eq!(r.total_files, 1);
+        assert_eq!(r.total_size, allocated(&d.join("real/x.bin")));
+    }
+
+    /// A plain directory on the parent filesystem is not a "drive"; scanning
+    /// it separately from `/` would recount the same content.
+    #[test]
+    fn plain_directory_is_not_a_mount_point() {
+        let d = tmpdir("not-a-mount");
+        assert!(!crate::is_mount_point(&d));
+        assert!(crate::is_mount_point(Path::new("/")));
+    }
+
+    /// Real mount points do compare different from their parent — take the
+    /// first non-`/`, non-bind mount from the kernel table.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_mounts_are_mount_points() {
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+        let target = mounts
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .map(PathBuf::from)
+            .find(|p| p != Path::new("/") && p.is_dir())
+            .expect("no mounted directory in /proc/self/mounts");
+        let child = target.join(format!("diskghost-not-mounted-{}", std::process::id()));
+        if std::fs::create_dir(&child).is_ok() {
+            assert!(!crate::is_mount_point(&child));
+            let _ = std::fs::remove_dir(&child);
+        }
+        assert!(crate::is_mount_point(&target));
+    }
 }

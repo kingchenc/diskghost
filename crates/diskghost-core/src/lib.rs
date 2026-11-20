@@ -441,6 +441,34 @@ pub fn scan_with_progress(
     ScanTree::build(root, opts, progress).root_report(top_n)
 }
 
+/// Whether `path` starts its own filesystem rather than being a directory on
+/// its parent's filesystem. A "drives" list uses this to keep plain folders
+/// under `/media`, `/run/media` or `/mnt` — which a `/` scan already covers —
+/// from being offered as extra drives and scanned a second time.
+///
+/// The check compares device ids; same-device mounts (bind mounts, btrfs
+/// subvolumes) count as the same filesystem — reasonable here, since listing
+/// them as separate drives would recount the same physical storage.
+#[cfg(unix)]
+pub fn is_mount_point(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    match path.parent() {
+        Some(parent) => std::fs::metadata(parent)
+            .map(|pm| pm.dev() != meta.dev())
+            .unwrap_or(true),
+        None => true, // the filesystem root itself
+    }
+}
+
+/// Non-unix fallback: only a filesystem root counts.
+#[cfg(not(unix))]
+pub fn is_mount_point(path: &Path) -> bool {
+    path.parent().is_none()
+}
+
 /// Total and available bytes of the filesystem that holds `path`. Returns
 /// `(0, 0)` if the platform query fails (e.g. an unmounted or unreadable path),
 /// so callers can treat 0 as "unknown" without handling an error.
