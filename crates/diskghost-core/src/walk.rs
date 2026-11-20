@@ -369,6 +369,67 @@ mod tests {
         assert!(crate::is_mount_point(Path::new("/")));
     }
 
+    /// `same_file_system` keeps a walk on the filesystem of its root: a
+    /// mounted child is listed but never opened. A `/` scan must not walk a
+    /// FUSE share or a second drive mounted below — live bug: a root scan
+    /// descended into `gvfsd` sftp/smb mounts, counted remote filesystems,
+    /// and could not be cancelled out of the blocked `read_dir`s.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn same_file_system_does_not_descend_into_other_filesystems() {
+        // Prefer a mount whose parent is an ordinary directory (a small
+        // walk); otherwise any direct child of `/` will do.
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+        let mut mounted: Vec<PathBuf> = mounts
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir() && crate::is_mount_point(p))
+            .collect();
+        mounted.sort();
+        let (root, target) = mounted
+            .iter()
+            .filter_map(|m| m.parent().map(|p| (p.to_path_buf(), m.clone())))
+            .find(|(p, _)| p != Path::new("/") && !crate::is_mount_point(p))
+            .or_else(|| {
+                mounted
+                    .iter()
+                    .find(|m| m.parent() == Some(Path::new("/")))
+                    .map(|m| (PathBuf::from("/"), m.clone()))
+            })
+            .expect("no mounted directory in /proc/self/mounts");
+
+        // Depth: the target would be descended into without the bound.
+        let depth = target.strip_prefix(&root).unwrap().components().count();
+        let collect = |opts: &Options| {
+            let visited = Mutex::new(Vec::new());
+            walk(&root, opts, &Progress::default(), |b| {
+                visited.lock().unwrap().push(b.dir);
+            });
+            visited.into_inner().unwrap()
+        };
+
+        // Unbounded: the mounted child is walked (documents that the flag is
+        // opt-in, not a change of the default traversal).
+        let opts = Options {
+            max_depth: Some(depth + 1),
+            ..Options::default()
+        };
+        assert!(
+            collect(&opts).contains(&target),
+            "unbounded walk should descend into {target:?}"
+        );
+
+        let opts = Options {
+            same_file_system: true,
+            ..opts
+        };
+        assert!(
+            !collect(&opts).contains(&target),
+            "bounded walk descended into foreign filesystem {target:?}"
+        );
+    }
+
     /// Real mount points do compare different from their parent — take the
     /// first non-`/`, non-bind mount from the kernel table.
     #[cfg(target_os = "linux")]

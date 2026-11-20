@@ -57,6 +57,12 @@ pub struct Options {
     /// volume, and does not follow links; otherwise the directory walk is
     /// used. See [`ScanTree::engine`] for which one ran.
     pub mft: bool,
+    /// Stay on the filesystem of the scan root (`du -x` semantics): other
+    /// mounts — network shares, FUSE folders, a second drive mounted inside
+    /// the tree — are listed as folders but never descended into. Scanning
+    /// `/` otherwise walks every attached share, which both miscounts and
+    /// stalls on remote or unresponsive filesystems.
+    pub same_file_system: bool,
 }
 
 /// Live progress + cancellation shared with a running scan / duplicate search.
