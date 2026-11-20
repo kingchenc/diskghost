@@ -48,6 +48,9 @@ struct Ctx<'a> {
     /// Canonical directories already entered — only kept when following
     /// links, where a link back up the tree would otherwise loop forever.
     seen: Option<Mutex<HashSet<PathBuf>>>,
+    /// Inodes already counted — hard links and followed symlinks reach the
+    /// same file through several names; it is charged only once.
+    files_seen: Mutex<HashSet<(u64, u64)>>,
 }
 
 impl Ctx<'_> {
@@ -105,6 +108,7 @@ pub(crate) fn walk_dyn(
         progress,
         tx,
         seen: opts.follow_symlinks.then(|| Mutex::new(HashSet::new())),
+        files_seen: Mutex::new(HashSet::new()),
     };
     if ctx.follow {
         ctx.first_visit(root);
@@ -216,6 +220,16 @@ fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth
                     continue;
                 }
             };
+            if let Some(id) = file_key(&meta) {
+                let first = ctx
+                    .files_seen
+                    .lock()
+                    .map(|mut s| s.insert(id))
+                    .unwrap_or(true);
+                if !first {
+                    continue;
+                }
+            }
             let size = on_disk_size(&meta, &path);
             bytes += size;
             b.modified.push(modified_ns(&meta));
@@ -233,6 +247,29 @@ fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth
         .fetch_add(b.files.len() as u64, Ordering::Relaxed);
     ctx.progress.bytes.fetch_add(bytes, Ordering::Relaxed);
     let _ = ctx.tx.send(b);
+}
+
+/// Device+inode identity of a counted file, so the same file reached through
+/// a second name (hard link) or a second path (followed symlink) is not
+/// charged twice. `None` where the platform supplies no identity.
+#[cfg(unix)]
+fn file_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// `file_key` on Windows: volume serial + file index.
+#[cfg(windows)]
+fn file_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    let index = meta.file_index();
+    (index != 0).then(|| (meta.volume_serial_number(), index))
+}
+
+/// `file_key` fallback: no identity available — no dedup.
+#[cfg(not(any(unix, windows)))]
+fn file_key(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 /// Modification time in nanoseconds since the Unix epoch (0 if unknown).
@@ -344,10 +381,7 @@ mod tests {
             .map(PathBuf::from)
             .find(|p| p != Path::new("/") && p.is_dir())
             .expect("no mounted directory in /proc/self/mounts");
-        let child = target.join(format!(
-            "diskghost-not-mounted-{}",
-            std::process::id()
-        ));
+        let child = target.join(format!("diskghost-not-mounted-{}", std::process::id()));
         if std::fs::create_dir(&child).is_ok() {
             assert!(!crate::is_mount_point(&child));
             let _ = std::fs::remove_dir(&child);

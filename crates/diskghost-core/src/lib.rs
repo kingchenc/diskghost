@@ -451,7 +451,16 @@ pub fn scan_with_progress(
 /// them as separate drives would recount the same physical storage.
 #[cfg(unix)]
 pub fn is_mount_point(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok()
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    match path.parent() {
+        Some(parent) => std::fs::metadata(parent)
+            .map(|pm| pm.dev() != meta.dev())
+            .unwrap_or(true),
+        None => true, // the filesystem root itself
+    }
 }
 
 /// Non-unix fallback: only a filesystem root counts.

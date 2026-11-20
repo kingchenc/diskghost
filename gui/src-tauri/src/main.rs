@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use diskghost_core::{
-    diff, disk_space, find_duplicates_cached, reclaim, remove_path, validate_globs, DiffReport,
-    DirSize, DupGroup, FileStats, HashCache, Options, Progress, ReclaimAction, ReclaimReport,
-    RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot,
+    diff, disk_space, find_duplicates_cached, is_mount_point, reclaim, remove_path, validate_globs,
+    DiffReport, DirSize, DupGroup, FileStats, HashCache, Options, Progress, ReclaimAction,
+    ReclaimReport, RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, LogicalSize, Manager};
@@ -840,10 +840,12 @@ fn drives() -> Vec<Drive> {
             continue;
         };
         for e in entries.flatten() {
-            // Skip symlinks (macOS links the boot volume back to `/`) and
-            // the per-user folders that only hold the real mounts.
+            // Skip symlinks (macOS links the boot volume back to `/`),
+            // the per-user folders that only hold the real mounts, and
+            // plain directories that are not mount points — listing one of
+            // those as a "drive" scans content the `/` scan already covers.
             let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir() && e.file_name().to_string_lossy() != user {
+            if ft.is_dir() && e.file_name().to_string_lossy() != user && is_mount_point(&e.path()) {
                 roots.push(e.path());
             }
         }
