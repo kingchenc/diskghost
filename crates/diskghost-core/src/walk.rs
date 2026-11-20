@@ -231,7 +231,7 @@ fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth
                     continue;
                 }
             };
-            if let Some(id) = file_key(&meta) {
+            if let Some(id) = file_key(&meta, ctx.follow) {
                 let first = ctx
                     .files_seen
                     .lock()
@@ -260,26 +260,20 @@ fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth
     let _ = ctx.tx.send(b);
 }
 
-/// Device+inode identity of a counted file, so the same file reached through
-/// a second name (hard link) or a second path (followed symlink) is not
-/// charged twice. `None` where the platform supplies no identity.
+/// Device+inode identity of a file that may be reached again — through a
+/// second name (hard link, `nlink > 1`) or, when links are followed, a second
+/// path (symlink) — so it is charged once. `None` for files that can only be
+/// met once: keeps the shared set (and its lock) off the common path.
 #[cfg(unix)]
-fn file_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+fn file_key(meta: &std::fs::Metadata, follow: bool) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    Some((meta.dev(), meta.ino()))
+    (follow || meta.nlink() > 1).then(|| (meta.dev(), meta.ino()))
 }
 
-/// `file_key` on Windows: volume serial + file index.
-#[cfg(windows)]
-fn file_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::windows::fs::MetadataExt;
-    let index = meta.file_index();
-    (index != 0).then(|| (meta.volume_serial_number(), index))
-}
-
-/// `file_key` fallback: no identity available — no dedup.
-#[cfg(not(any(unix, windows)))]
-fn file_key(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+/// `file_key` elsewhere: no stable file identity in `std` (Windows'
+/// `file_index` is unstable, `windows_by_handle`) — no dedup.
+#[cfg(not(unix))]
+fn file_key(_meta: &std::fs::Metadata, _follow: bool) -> Option<(u64, u64)> {
     None
 }
 
@@ -292,6 +286,8 @@ pub(crate) fn modified_ns(meta: &std::fs::Metadata) -> u64 {
 }
 
 #[cfg(test)]
+// Most cases need unix links/inodes; elsewhere the shared helpers sit unused.
+#[cfg_attr(not(unix), allow(unused_imports, dead_code))]
 mod tests {
     use super::*;
     use crate::{scan_with_progress, Options, Progress};
@@ -321,6 +317,7 @@ mod tests {
     /// Two names for one inode must add their bytes once, not twice — a
     /// backup tree made of `cp -al` / `--link-dest` hard links otherwise
     /// reports a multiple of the space it actually occupies.
+    #[cfg(unix)]
     #[test]
     fn hardlinked_entries_share_one_charge() {
         let d = tmpdir("hardlink");
