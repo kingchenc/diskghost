@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Mutex};
 
-use crate::{build_globset, is_excluded, on_disk_size, FileEntry, Options, Progress};
+use crate::{
+    build_globset, is_excluded, is_mount_point, on_disk_size, FileEntry, Options, Progress,
+};
 
 /// What one directory contains.
 pub(crate) struct Batch {
@@ -51,6 +53,9 @@ struct Ctx<'a> {
     /// Inodes already counted — hard links and followed symlinks reach the
     /// same file through several names; it is charged only once.
     files_seen: Mutex<HashSet<(u64, u64)>>,
+    /// Stay on the filesystem of `root`: mounted children are listed but
+    /// never descended into (`du -x` semantics).
+    same_file_system: bool,
 }
 
 impl Ctx<'_> {
@@ -109,6 +114,7 @@ pub(crate) fn walk_dyn(
         tx,
         seen: opts.follow_symlinks.then(|| Mutex::new(HashSet::new())),
         files_seen: Mutex::new(HashSet::new()),
+        same_file_system: opts.same_file_system,
     };
     if ctx.follow {
         ctx.first_visit(root);
@@ -168,8 +174,8 @@ fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth
     let child_depth = depth + 1;
     let descend = ctx.max_depth.map_or(true, |m| child_depth < m);
     let mut bytes = 0u64;
-    for (i, entry) in entries.enumerate() {
-        if i % 1024 == 1023 && ctx.progress.cancelled() {
+    for entry in entries {
+        if ctx.progress.cancelled() {
             break;
         }
         let Ok(entry) = entry else {
@@ -207,7 +213,12 @@ fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth
             if ctx.follow && !ctx.first_visit(&path) {
                 continue;
             }
-            if descend {
+            // Another filesystem mounted below the root stays out of bounds:
+            // listed like a depth-limited folder (shown as not measured) but
+            // never opened — network and FUSE mounts would otherwise walk
+            // remote trees and stall the scan on every read.
+            let in_bounds = !ctx.same_file_system || !is_mount_point(&path);
+            if descend && in_bounds {
                 let sub = path.clone();
                 s.spawn(move |s| visit(s, ctx, sub, child_depth));
             }

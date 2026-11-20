@@ -175,6 +175,10 @@ struct WalkArgs {
     /// directory walk otherwise).
     #[arg(long)]
     mft: bool,
+    /// Stay on the filesystem of the scan root — never descend into other
+    /// mounts (network shares, FUSE folders, drives mounted inside the tree).
+    #[arg(short = 'x', long = "one-file-system")]
+    one_file_system: bool,
 }
 
 impl WalkArgs {
@@ -185,6 +189,7 @@ impl WalkArgs {
             exclude: self.exclude.clone(),
             threads: self.threads,
             mft: self.mft,
+            same_file_system: self.one_file_system,
         }
     }
 }

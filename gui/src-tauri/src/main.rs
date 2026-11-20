@@ -97,6 +97,9 @@ struct WalkOpts {
     threads: Option<usize>,
     /// Read the NTFS Master File Table (needs administrator rights).
     mft: bool,
+    /// Set by the backend per scan root: a scan rooted on a mount point
+    /// (every "drive" is one) stays on that filesystem.
+    same_file_system: bool,
 }
 
 impl WalkOpts {
@@ -107,6 +110,7 @@ impl WalkOpts {
             exclude: self.exclude.clone(),
             threads: self.threads,
             mft: self.mft,
+            same_file_system: self.same_file_system,
         }
     }
 }
@@ -292,6 +296,12 @@ async fn scan_dir(
         if !requested.is_dir() {
             return Err(format!("not a directory: {path}"));
         }
+        // A drive stays on its own filesystem: scanning `/` must not walk the
+        // FUSE/network mounts below it (a scan once descended into gvfs
+        // sftp/smb mounts, counted remote trees and sat in remote `read_dir`s
+        // long past Cancel).
+        let mut opts = opts;
+        opts.same_file_system = is_mount_point(&requested);
         let (tree, snap) = build_tree(&app, job, &requested, &opts, &running.progress);
         drop(running);
         let view = view_of(&tree, tree.root(), top).ok_or("scan produced no tree")?;
