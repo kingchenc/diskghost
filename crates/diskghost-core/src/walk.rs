@@ -59,6 +59,11 @@ struct Ctx<'a> {
     /// Device ids of remote filesystems ([`Options::skip_remote`]) other than
     /// the root's: listed when met, never descended into.
     remote: HashSet<u64>,
+    /// Device of the root itself, when the root sits on a remote filesystem
+    /// (the user's explicit choice — it is walked). Its directories get the
+    /// lexical cycle guard: remote symlink loops answer with fresh inodes per
+    /// path, so identity dedup can never fire there.
+    remote_root: Option<u64>,
 }
 
 impl Ctx<'_> {
@@ -130,6 +135,7 @@ fn walk_with_remote(
     } else {
         None
     };
+    let remote_root = root_dev.filter(|d| remote.contains(d));
     if let Some(dev) = root_dev {
         remote.remove(&dev);
     }
@@ -146,6 +152,7 @@ fn walk_with_remote(
         files_seen: Mutex::new(HashSet::new()),
         same_file_system: opts.same_file_system,
         remote,
+        remote_root,
     };
     if ctx.follow {
         ctx.first_visit(root);
@@ -258,6 +265,22 @@ fn dev_of(_meta: Option<&std::fs::Metadata>, _path: &Path) -> Option<u64> {
     None
 }
 
+/// A remote filesystem answers a symlink loop with a fresh inode per path —
+/// no identity check (canonical path, device+inode) can ever fire. The only
+/// signal left is the path itself: a tail of ≥3 consecutive copies of the
+/// same period of ≥2 segments is a filesystem cycle (a remote `/sys` repeats
+/// `subsystem/<name>`), not a real tree. Kept to period ≥2 so a legitimate
+/// `a/a/a/…` style name stays walkable even on a share.
+fn looks_like_cycle(path: &Path) -> bool {
+    let segs: Vec<_> = path.components().map(|c| c.as_os_str()).collect();
+    let n = segs.len();
+    (2..=16).any(|p| {
+        n >= 3 * p
+            && segs[n - p..] == segs[n - 2 * p..n - p]
+            && segs[n - p..] == segs[n - 3 * p..n - 2 * p]
+    })
+}
+
 /// How a tree was read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Engine {
@@ -345,18 +368,23 @@ fn visit<'s, 'c: 's>(
             // (`skip_remote`) however it is reached — mounted below, or via a
             // followed link. Remote and FUSE trees otherwise stall the scan
             // on every read, and gvfs loops through a remote `/sys` forever.
-            let sub_dev = if ctx.same_file_system || !ctx.remote.is_empty() {
-                dev_of(meta.as_ref(), &path)
-            } else {
-                None
-            };
+            let sub_dev =
+                if ctx.same_file_system || !ctx.remote.is_empty() || ctx.remote_root.is_some() {
+                    dev_of(meta.as_ref(), &path)
+                } else {
+                    None
+                };
             let foreign = match (sub_dev, dev) {
                 (Some(sub), Some(here)) => sub != here,
                 // No device ids (not unix, or a failed stat): ask the path.
                 _ => ctx.same_file_system && is_mount_point(&path),
             };
+            // On a remote-rooted walk, identity dedup can never fire (fresh
+            // inode per path), so the lexical cycle guard is the last bound.
+            let on_remote_root = matches!((ctx.remote_root, sub_dev), (Some(r), Some(d)) if d == r);
             let in_bounds = !(ctx.same_file_system && foreign)
-                && !sub_dev.is_some_and(|d| ctx.remote.contains(&d));
+                && !sub_dev.is_some_and(|d| ctx.remote.contains(&d))
+                && !(on_remote_root && looks_like_cycle(&path));
             if descend && in_bounds {
                 let sub = path.clone();
                 s.spawn(move |s| visit(s, ctx, sub, child_depth, sub_dev));
@@ -741,6 +769,51 @@ mod tests {
         ] {
             assert!(!is_remote_fs(t), "{t} should be local");
         }
+    }
+
+    /// The remaining 0.12.3 risk, closed here: a scan rooted directly on a
+    /// remote filesystem (the user's explicit choice) must still not run
+    /// forever — gvfs serves remote symlink loops as plain directories with a
+    /// fresh inode per path, so the only signal is the path itself. A tail of
+    /// ≥3 consecutive copies of the same ≥2-segment period is a filesystem
+    /// loop (remote `/sys` repeats `subsystem/<name>`), not a real tree, and
+    /// is listed but never opened. A local root walks the identical shape in
+    /// full — remote symlink loops do not exist there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_root_stops_at_repeating_path_cycles() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tmpdir("remote-cycle");
+        // The remote `/sys` shape: one repeated <subsystem>/<name> pair.
+        let mut deep = d.join("loop");
+        for _ in 0..6 {
+            deep = deep.join("sub").join("x");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let plain = d.join("plain/a/b/c/d/e");
+        std::fs::create_dir_all(&plain).unwrap();
+        let dev = std::fs::metadata(&d).unwrap().dev();
+        let opts = Options {
+            skip_remote: true,
+            ..Options::default()
+        };
+
+        // Same root marked remote: the cycle is bounded, the plain branch is not.
+        let dirs = listed(&d, &opts, &[dev]);
+        assert!(
+            dirs.iter()
+                .all(|p| p.components().filter(|c| c.as_os_str() == "x").count() <= 2),
+            "walk descended past a repeating remote cycle: {dirs:?}"
+        );
+        assert!(dirs.contains(&plain), "plain deep tree must be walked");
+
+        // Same root, local: everything is walked — the guard only fires on a
+        // filesystem the walk itself classified as remote.
+        let dirs = listed(&d, &opts, &[]);
+        assert!(
+            dirs.contains(&deep),
+            "a local tree with repeated names must be walked in full: {dirs:?}"
+        );
     }
 
     /// `major:minor` from mountinfo maps to the same id `stat` reports.
