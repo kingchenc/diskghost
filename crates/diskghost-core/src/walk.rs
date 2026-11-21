@@ -56,6 +56,9 @@ struct Ctx<'a> {
     /// Stay on the filesystem of `root`: mounted children are listed but
     /// never descended into (`du -x` semantics).
     same_file_system: bool,
+    /// Device ids of remote filesystems ([`Options::skip_remote`]) other than
+    /// the root's: listed when met, never descended into.
+    remote: HashSet<u64>,
 }
 
 impl Ctx<'_> {
@@ -86,6 +89,23 @@ pub(crate) fn walk_dyn(
     progress: &Progress,
     sink: &mut dyn FnMut(Batch),
 ) -> (Engine, Option<String>) {
+    let remote = if opts.skip_remote {
+        remote_devices()
+    } else {
+        HashSet::new()
+    };
+    walk_with_remote(root, opts, progress, sink, remote)
+}
+
+/// [`walk_dyn`] with the set of remote filesystems (device ids) given — the
+/// seam that lets tests mark a local mount as remote.
+fn walk_with_remote(
+    root: &Path,
+    opts: &Options,
+    progress: &Progress,
+    sink: &mut dyn FnMut(Batch),
+    mut remote: HashSet<u64>,
+) -> (Engine, Option<String>) {
     // Why the MFT was asked for but not used.
     let mut fallback = None;
     if opts.mft {
@@ -103,6 +123,16 @@ pub(crate) fn walk_dyn(
             fallback = Some("the MFT engine exists on Windows only".to_string());
         }
     }
+    // Device of the root: the reference for both bounds. A root on a remote
+    // filesystem is the user's explicit choice, so that one is walked.
+    let root_dev = if opts.same_file_system || !remote.is_empty() {
+        dev_of(None, root)
+    } else {
+        None
+    };
+    if let Some(dev) = root_dev {
+        remote.remove(&dev);
+    }
     let threads = opts.threads.unwrap_or_else(default_threads).max(1);
     let (tx, rx) = mpsc::channel();
     let ctx = Ctx {
@@ -115,6 +145,7 @@ pub(crate) fn walk_dyn(
         seen: opts.follow_symlinks.then(|| Mutex::new(HashSet::new())),
         files_seen: Mutex::new(HashSet::new()),
         same_file_system: opts.same_file_system,
+        remote,
     };
     if ctx.follow {
         ctx.first_visit(root);
@@ -127,8 +158,8 @@ pub(crate) fn walk_dyn(
                 .thread_name(|i| format!("diskghost-walk-{i}"))
                 .build()
             {
-                Ok(pool) => pool.scope(|s| visit(s, &ctx, start, 0)),
-                Err(_) => rayon::scope(|s| visit(s, &ctx, start, 0)),
+                Ok(pool) => pool.scope(|s| visit(s, &ctx, start, 0, root_dev)),
+                Err(_) => rayon::scope(|s| visit(s, &ctx, start, 0, root_dev)),
             }
             // `ctx` (and with it the sender) drops here, ending the receiver loop.
         });
@@ -137,6 +168,94 @@ pub(crate) fn walk_dyn(
         }
     });
     (Engine::Walk, fallback)
+}
+
+/// Device ids of the mounted network and FUSE filesystems, read from the
+/// kernel's mount table — no call ever reaches the (possibly hung) share.
+#[cfg(target_os = "linux")]
+fn remote_devices() -> HashSet<u64> {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|info| {
+            info.lines()
+                .filter_map(parse_mountinfo_line)
+                .filter(|(_, t)| is_remote_fs(t))
+                .map(|(dev, _)| dev)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remote_devices() -> HashSet<u64> {
+    HashSet::new()
+}
+
+/// FUSE filesystems that only re-present local storage: walked like any
+/// local disk. Every other FUSE filesystem (`gvfsd-fuse`, `sshfs`, `rclone`,
+/// `s3fs`, the document portal, …) counts as remote — its daemon may answer
+/// from the network, block, or loop.
+const LOCAL_FUSE: &[&str] = &[
+    "mergerfs",
+    "bindfs",
+    "gocryptfs",
+    "encfs",
+    "cryfs",
+    "securefs",
+    "unionfs",
+    "unionfs-fuse",
+    "fuse-overlayfs",
+    "ntfs-3g",
+    "exfat",
+    "exfat-fuse",
+    "squashfuse",
+];
+
+/// Whether a filesystem type (as in `/proc/self/mountinfo`) is reached over
+/// the network or through a non-local FUSE daemon. `fuseblk` (ntfs-3g and
+/// exFAT on a local block device) is local.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+fn is_remote_fs(fstype: &str) -> bool {
+    match fstype {
+        "nfs" | "nfs4" | "cifs" | "smb3" | "smbfs" | "ncpfs" | "afs" | "ceph" | "glusterfs"
+        | "lustre" | "davfs" | "fuse" => true,
+        t => t
+            .strip_prefix("fuse.")
+            .is_some_and(|sub| !LOCAL_FUSE.contains(&sub)),
+    }
+}
+
+/// Device id and filesystem type of one `/proc/self/mountinfo` line
+/// (`id parent major:minor root mountpoint options [tags] - fstype ...`).
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+fn parse_mountinfo_line(line: &str) -> Option<(u64, &str)> {
+    let (head, tail) = line.split_once(" - ")?;
+    let (major, minor) = head.split_whitespace().nth(2)?.split_once(':')?;
+    let fstype = tail.split_whitespace().next()?;
+    Some((makedev(major.parse().ok()?, minor.parse().ok()?), fstype))
+}
+
+/// glibc's `makedev`: the `st_dev` value of device `major:minor`.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+fn makedev(major: u64, minor: u64) -> u64 {
+    ((major & 0xffff_f000) << 32)
+        | ((major & 0x0000_0fff) << 8)
+        | ((minor & 0xffff_ff00) << 12)
+        | (minor & 0x0000_00ff)
+}
+
+/// Device id of a directory (following a link), if the platform has one.
+#[cfg(unix)]
+fn dev_of(meta: Option<&std::fs::Metadata>, path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    match meta {
+        Some(m) => Some(m.dev()),
+        None => std::fs::metadata(path).ok().map(|m| m.dev()),
+    }
+}
+
+#[cfg(not(unix))]
+fn dev_of(_meta: Option<&std::fs::Metadata>, _path: &Path) -> Option<u64> {
+    None
 }
 
 /// How a tree was read.
@@ -149,7 +268,14 @@ pub enum Engine {
     Mft,
 }
 
-fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth: usize) {
+/// List `dir` (device `dev`, when known) and spawn a task per subdirectory.
+fn visit<'s, 'c: 's>(
+    s: &rayon::Scope<'s>,
+    ctx: &'c Ctx<'c>,
+    dir: PathBuf,
+    depth: usize,
+    dev: Option<u64>,
+) {
     if ctx.progress.cancelled() {
         return;
     }
@@ -213,14 +339,27 @@ fn visit<'s, 'c: 's>(s: &rayon::Scope<'s>, ctx: &'c Ctx<'c>, dir: PathBuf, depth
             if ctx.follow && !ctx.first_visit(&path) {
                 continue;
             }
-            // Another filesystem mounted below the root stays out of bounds:
-            // listed like a depth-limited folder (shown as not measured) but
-            // never opened — network and FUSE mounts would otherwise walk
-            // remote trees and stall the scan on every read.
-            let in_bounds = !ctx.same_file_system || !is_mount_point(&path);
+            // Out of bounds — listed like a depth-limited folder (shown as
+            // not measured) but never opened: another filesystem when the
+            // walk stays on the root's (`same_file_system`), and a remote one
+            // (`skip_remote`) however it is reached — mounted below, or via a
+            // followed link. Remote and FUSE trees otherwise stall the scan
+            // on every read, and gvfs loops through a remote `/sys` forever.
+            let sub_dev = if ctx.same_file_system || !ctx.remote.is_empty() {
+                dev_of(meta.as_ref(), &path)
+            } else {
+                None
+            };
+            let foreign = match (sub_dev, dev) {
+                (Some(sub), Some(here)) => sub != here,
+                // No device ids (not unix, or a failed stat): ask the path.
+                _ => ctx.same_file_system && is_mount_point(&path),
+            };
+            let in_bounds = !(ctx.same_file_system && foreign)
+                && !sub_dev.is_some_and(|d| ctx.remote.contains(&d));
             if descend && in_bounds {
                 let sub = path.clone();
-                s.spawn(move |s| visit(s, ctx, sub, child_depth));
+                s.spawn(move |s| visit(s, ctx, sub, child_depth, sub_dev));
             }
             b.subdirs.push(path);
         } else if ft.is_file() {
@@ -456,5 +595,173 @@ mod tests {
             let _ = std::fs::remove_dir(&child);
         }
         assert!(crate::is_mount_point(&target));
+    }
+
+    /// A readable mounted directory on another filesystem than `near`, and
+    /// its device id — stands in for a remote share (no real network needed).
+    /// Only local non-FUSE mounts are candidates, chosen from the mount table
+    /// before any `stat`: the tests never touch a real share (gvfs, NFS, …).
+    #[cfg(target_os = "linux")]
+    fn foreign_mount(near: &Path) -> (PathBuf, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let here = std::fs::metadata(near).unwrap().dev();
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+        mounts
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace().skip(1);
+                let (path, fstype) = (f.next()?, f.next()?);
+                (!fstype.starts_with("fuse") && !is_remote_fs(fstype)).then_some(path)
+            })
+            .map(PathBuf::from)
+            .filter(|p| p != Path::new("/") && crate::is_mount_point(p))
+            .filter(|p| std::fs::read_dir(p).is_ok())
+            .find_map(|p| {
+                let dev = std::fs::metadata(&p).ok()?.dev();
+                (dev != here).then_some((p, dev))
+            })
+            .expect("no readable mount on another filesystem")
+    }
+
+    /// Directories `walk` listed under `root`, with `remote` marked remote.
+    #[cfg(target_os = "linux")]
+    fn listed(root: &Path, opts: &Options, remote: &[u64]) -> Vec<PathBuf> {
+        let visited = Mutex::new(Vec::new());
+        walk_with_remote(
+            root,
+            opts,
+            &Progress::default(),
+            &mut |b: Batch| visited.lock().unwrap().push(b.dir),
+            remote.iter().copied().collect(),
+        );
+        visited.into_inner().unwrap()
+    }
+
+    /// Live incident (0.12.2, ~600 min, never finished): a GUI scan reached
+    /// `/run/user/1000/gvfs/sftp:host=…` through a followed link and walked
+    /// the remote host's `/sys` forever — gvfs serves remote symlinks as
+    /// plain directories with a new inode per path, so no loop check can
+    /// stop it. A followed link into a remote filesystem must not be opened.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn followed_link_into_remote_fs_is_not_descended() {
+        let d = tmpdir("link-remote");
+        let (mount, dev) = foreign_mount(&d);
+        let link = d.join("share");
+        std::os::unix::fs::symlink(&mount, &link).unwrap();
+        let opts = Options {
+            follow_symlinks: true,
+            skip_remote: true,
+            max_depth: Some(2),
+            ..Options::default()
+        };
+
+        // Not remote: the link is followed and its target listed (follow
+        // keeps working for local filesystems).
+        assert!(listed(&d, &opts, &[]).contains(&link));
+        // Remote: listed as a folder of the root, never opened.
+        let dirs = listed(&d, &opts, &[dev]);
+        assert!(
+            !dirs.iter().any(|p| p.starts_with(&link)),
+            "walk descended into remote filesystem through {link:?}: {dirs:?}"
+        );
+        assert!(dirs.contains(&d), "the root itself is still listed");
+    }
+
+    /// A remote filesystem mounted below the root is not descended into even
+    /// when `same_file_system` is off — the GUI scans ordinary folders
+    /// without the bound, and that is how gvfs mounts were reached.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mounted_remote_fs_is_not_descended_without_same_file_system() {
+        let (mount, dev) = foreign_mount(&std::env::temp_dir());
+        let root = mount.parent().unwrap().to_path_buf();
+        let opts = Options {
+            skip_remote: true,
+            max_depth: Some(mount.strip_prefix(&root).unwrap().components().count() + 1),
+            ..Options::default()
+        };
+        // Local: walked (a second local disk inside the tree stays counted).
+        assert!(listed(&root, &opts, &[]).contains(&mount));
+        // Remote: not walked.
+        assert!(
+            !listed(&root, &opts, &[dev]).contains(&mount),
+            "walk descended into remote mount {mount:?}"
+        );
+    }
+
+    /// Scanning the remote share itself is the user's explicit choice: a root
+    /// on a remote filesystem is walked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_root_is_still_walked() {
+        let (mount, dev) = foreign_mount(&std::env::temp_dir());
+        let opts = Options {
+            skip_remote: true,
+            max_depth: Some(2),
+            ..Options::default()
+        };
+        let dirs = listed(&mount, &opts, &[dev]);
+        let has_subdir = std::fs::read_dir(&mount)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_type().is_ok_and(|t| t.is_dir()));
+        if has_subdir {
+            assert!(dirs.len() > 1, "remote root was not walked: {dirs:?}");
+        }
+    }
+
+    /// The live gvfs mount is classified remote from `/proc/self/mountinfo`
+    /// (read-only table, no access to the share): `fuse.gvfsd-fuse`, NFS,
+    /// SMB are remote; local and local-FUSE filesystems are not.
+    #[test]
+    fn remote_fs_types() {
+        for t in [
+            "fuse.gvfsd-fuse",
+            "fuse.sshfs",
+            "fuse.rclone",
+            "nfs",
+            "nfs4",
+            "cifs",
+            "smb3",
+        ] {
+            assert!(is_remote_fs(t), "{t} should be remote");
+        }
+        for t in [
+            "ext4",
+            "btrfs",
+            "xfs",
+            "tmpfs",
+            "fuseblk",
+            "fuse.mergerfs",
+            "fuse.gocryptfs",
+            "ntfs3",
+            "squashfs",
+            "overlay",
+        ] {
+            assert!(!is_remote_fs(t), "{t} should be local");
+        }
+    }
+
+    /// `major:minor` from mountinfo maps to the same id `stat` reports.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_dev_matches_stat() {
+        use std::os::unix::fs::MetadataExt;
+        let line = "2188 190 0:78 / /run/user/1000/gvfs rw,nosuid,nodev,relatime \
+                    shared:1525 - fuse.gvfsd-fuse gvfsd-fuse rw,user_id=1000";
+        assert_eq!(
+            parse_mountinfo_line(line),
+            Some((makedev(0, 78), "fuse.gvfsd-fuse"))
+        );
+        // Against the kernel: `/proc` (btrfs is the known exception — its
+        // mountinfo shows the superblock, `stat` the subvolume; never remote).
+        let proc_dev = std::fs::metadata("/proc").unwrap().dev();
+        let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let line = info
+            .lines()
+            .find(|l| l.split_whitespace().nth(4) == Some("/proc"))
+            .expect("/proc not in mountinfo");
+        assert_eq!(parse_mountinfo_line(line), Some((proc_dev, "proc")));
     }
 }

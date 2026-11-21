@@ -190,6 +190,7 @@ impl WalkArgs {
             threads: self.threads,
             mft: self.mft,
             same_file_system: self.one_file_system,
+            skip_remote: false,
         }
     }
 }

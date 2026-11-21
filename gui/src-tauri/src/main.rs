@@ -111,6 +111,11 @@ impl WalkOpts {
             threads: self.threads,
             mft: self.mft,
             same_file_system: self.same_file_system,
+            // Every GUI walk (scan, drill-in, duplicates) stays off network
+            // and FUSE shares met below its root or through a link: one such
+            // scan reached gvfs sftp and walked a remote `/sys` for ten hours.
+            // A share chosen as the root is still scanned.
+            skip_remote: true,
         }
     }
 }

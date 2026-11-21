@@ -63,6 +63,19 @@ pub struct Options {
     /// `/` otherwise walks every attached share, which both miscounts and
     /// stalls on remote or unresponsive filesystems.
     pub same_file_system: bool,
+    /// Never descend into a network or FUSE filesystem (NFS, SMB/CIFS,
+    /// `sshfs`, GNOME `gvfsd-fuse`, rclone, …) that the walk meets below its
+    /// root — directly or through a followed link — unless the root itself is
+    /// on it. Such a mount is listed like any other folder but not opened.
+    /// Local filesystems, including local FUSE ones (`fuseblk` NTFS/exFAT,
+    /// mergerfs, gocryptfs, …), are walked as before. Linux only (needs
+    /// `/proc/self/mountinfo`); elsewhere a no-op.
+    ///
+    /// A remote tree cannot be bounded by loop detection: `gvfsd-fuse`
+    /// serves a remote symlink as a plain directory with a fresh inode for
+    /// every path, so a remote `/sys` loops forever and every directory
+    /// identity check (path or device+inode) sees only new directories.
+    pub skip_remote: bool,
 }
 
 /// Live progress + cancellation shared with a running scan / duplicate search.
