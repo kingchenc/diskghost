@@ -57,6 +57,25 @@ pub struct Options {
     /// volume, and does not follow links; otherwise the directory walk is
     /// used. See [`ScanTree::engine`] for which one ran.
     pub mft: bool,
+    /// Stay on the filesystem of the scan root (`du -x` semantics): other
+    /// mounts — network shares, FUSE folders, a second drive mounted inside
+    /// the tree — are listed as folders but never descended into. Scanning
+    /// `/` otherwise walks every attached share, which both miscounts and
+    /// stalls on remote or unresponsive filesystems.
+    pub same_file_system: bool,
+    /// Never descend into a network or FUSE filesystem (NFS, SMB/CIFS,
+    /// `sshfs`, GNOME `gvfsd-fuse`, rclone, …) that the walk meets below its
+    /// root — directly or through a followed link — unless the root itself is
+    /// on it. Such a mount is listed like any other folder but not opened.
+    /// Local filesystems, including local FUSE ones (`fuseblk` NTFS/exFAT,
+    /// mergerfs, gocryptfs, …), are walked as before. Linux only (needs
+    /// `/proc/self/mountinfo`); elsewhere a no-op.
+    ///
+    /// A remote tree cannot be bounded by loop detection: `gvfsd-fuse`
+    /// serves a remote symlink as a plain directory with a fresh inode for
+    /// every path, so a remote `/sys` loops forever and every directory
+    /// identity check (path or device+inode) sees only new directories.
+    pub skip_remote: bool,
 }
 
 /// Live progress + cancellation shared with a running scan / duplicate search.
@@ -439,6 +458,34 @@ pub fn scan_with_progress(
     progress: &Progress,
 ) -> ScanReport {
     ScanTree::build(root, opts, progress).root_report(top_n)
+}
+
+/// Whether `path` starts its own filesystem rather than being a directory on
+/// its parent's filesystem. A "drives" list uses this to keep plain folders
+/// under `/media`, `/run/media` or `/mnt` — which a `/` scan already covers —
+/// from being offered as extra drives and scanned a second time.
+///
+/// The check compares device ids; same-device mounts (bind mounts, btrfs
+/// subvolumes) count as the same filesystem — reasonable here, since listing
+/// them as separate drives would recount the same physical storage.
+#[cfg(unix)]
+pub fn is_mount_point(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    match path.parent() {
+        Some(parent) => std::fs::metadata(parent)
+            .map(|pm| pm.dev() != meta.dev())
+            .unwrap_or(true),
+        None => true, // the filesystem root itself
+    }
+}
+
+/// Non-unix fallback: only a filesystem root counts.
+#[cfg(not(unix))]
+pub fn is_mount_point(path: &Path) -> bool {
+    path.parent().is_none()
 }
 
 /// Total and available bytes of the filesystem that holds `path`. Returns

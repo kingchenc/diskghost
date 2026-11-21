@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use diskghost_core::{
-    diff, disk_space, find_duplicates_cached, reclaim, remove_path, validate_globs, DiffReport,
-    DirSize, DupGroup, FileStats, HashCache, Options, Progress, ReclaimAction, ReclaimReport,
-    RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot,
+    diff, disk_space, find_duplicates_cached, is_mount_point, reclaim, remove_path, validate_globs,
+    DiffReport, DirSize, DupGroup, FileStats, HashCache, Options, Progress, ReclaimAction,
+    ReclaimReport, RemoveMode, RemoveReport, ScanReport, ScanTree, Snapshot,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, LogicalSize, Manager};
@@ -97,6 +97,9 @@ struct WalkOpts {
     threads: Option<usize>,
     /// Read the NTFS Master File Table (needs administrator rights).
     mft: bool,
+    /// Set by the backend per scan root: a scan rooted on a mount point
+    /// (every "drive" is one) stays on that filesystem.
+    same_file_system: bool,
 }
 
 impl WalkOpts {
@@ -107,6 +110,12 @@ impl WalkOpts {
             exclude: self.exclude.clone(),
             threads: self.threads,
             mft: self.mft,
+            same_file_system: self.same_file_system,
+            // Every GUI walk (scan, drill-in, duplicates) stays off network
+            // and FUSE shares met below its root or through a link: one such
+            // scan reached gvfs sftp and walked a remote `/sys` for ten hours.
+            // A share chosen as the root is still scanned.
+            skip_remote: true,
         }
     }
 }
@@ -292,6 +301,12 @@ async fn scan_dir(
         if !requested.is_dir() {
             return Err(format!("not a directory: {path}"));
         }
+        // A drive stays on its own filesystem: scanning `/` must not walk the
+        // FUSE/network mounts below it (a scan once descended into gvfs
+        // sftp/smb mounts, counted remote trees and sat in remote `read_dir`s
+        // long past Cancel).
+        let mut opts = opts;
+        opts.same_file_system = is_mount_point(&requested);
         let (tree, snap) = build_tree(&app, job, &requested, &opts, &running.progress);
         drop(running);
         let view = view_of(&tree, tree.root(), top).ok_or("scan produced no tree")?;
@@ -840,10 +855,12 @@ fn drives() -> Vec<Drive> {
             continue;
         };
         for e in entries.flatten() {
-            // Skip symlinks (macOS links the boot volume back to `/`) and
-            // the per-user folders that only hold the real mounts.
+            // Skip symlinks (macOS links the boot volume back to `/`),
+            // the per-user folders that only hold the real mounts, and
+            // plain directories that are not mount points — listing one of
+            // those as a "drive" scans content the `/` scan already covers.
             let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir() && e.file_name().to_string_lossy() != user {
+            if ft.is_dir() && e.file_name().to_string_lossy() != user && is_mount_point(&e.path()) {
                 roots.push(e.path());
             }
         }
